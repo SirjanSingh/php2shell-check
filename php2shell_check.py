@@ -322,6 +322,180 @@ def cmd_harden(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- scan-logs / detection ---------------------------------------------------
+#
+# These indicators are behavioral detection guidance published by security
+# vendors after the 2026-10-21 disclosure. They detect *attempts*; they are not
+# exploit code and do not reproduce the vulnerability. Each carries its source
+# so the logic is auditable. Validate against your own logs — vendors note these
+# are based on expected exploit behavior, not confirmed atomic IoCs.
+
+@dataclass
+class Indicator:
+    id: str
+    severity: str          # high | medium | low
+    log_types: tuple       # which log kinds this applies to
+    pattern: "re.Pattern"
+    description: str
+    source: str
+
+
+LINE_INDICATORS = [
+    Indicator(
+        "upload_progress_field", "high", ("waf", "body"),
+        re.compile(r"PHP_SESSION_UPLOAD_PROGRESS"),
+        "PHP_SESSION_UPLOAD_PROGRESS field in a request body — near-zero "
+        "legitimate use; with the setting disabled it is effectively an attempt.",
+        "Splunk / Zafran",
+    ),
+    Indicator(
+        "php_tag_in_upload", "high", ("waf", "body"),
+        re.compile(r'filename="[^"]*<\?(?:php|=)', re.IGNORECASE),
+        "Upload filename contains a PHP open tag — attempt to smuggle "
+        "executable PHP through session upload-progress handling.",
+        "Splunk",
+    ),
+    Indicator(
+        "serialized_in_upload", "high", ("waf", "body"),
+        re.compile(r'(?:O:\d+:"|a:\d+:\{)'),
+        "Serialized PHP object/array marker in a request body — payload shape "
+        "for the upload-progress deserialization path.",
+        "Splunk",
+    ),
+    Indicator(
+        "php_fatal_unknown_line0", "medium", ("error",),
+        re.compile(r"Unknown on line 0"),
+        "PHP fatal error on 'Unknown on line 0' — memory exhaustion outside "
+        "normal script execution, consistent with the use-after-free trigger.",
+        "Abstract Security",
+    ),
+    Indicator(
+        "apache_child_exit", "low", ("error",),
+        re.compile(r"AH00052"),
+        "Apache child-process exit (AH00052) — large/malformed POSTs can crash "
+        "workers; noisy on its own, corroborating alongside the above.",
+        "Abstract Security",
+    ),
+]
+
+# Access-log heuristic thresholds (bodies are usually not logged, so we fall
+# back to volume signals).
+_ACCESS_RE = re.compile(
+    r'^(\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(\S+)\s+(\S+)[^"]*"\s+(\d{3})\s+(\S+)'
+)
+DEFAULT_LARGE_POST_BYTES = 100_000
+DEFAULT_BURST = 3
+
+
+@dataclass
+class Finding:
+    file: str
+    line_no: int
+    indicator_id: str
+    severity: str
+    excerpt: str
+
+
+@dataclass
+class AccessAlert:
+    file: str
+    ip: str
+    large_posts: int
+    total_posts: int
+
+
+def guess_log_type(sample: str) -> str:
+    if "PHP_SESSION_UPLOAD_PROGRESS" in sample or "filename=" in sample:
+        return "waf"
+    if "Unknown on line 0" in sample or "AH00052" in sample or "PHP Fatal" in sample:
+        return "error"
+    if _ACCESS_RE.search(sample):
+        return "access"
+    return "unknown"
+
+
+def scan_file(path: str, forced_type: Optional[str],
+              large_bytes: int, burst: int) -> tuple[list[Finding], list[AccessAlert]]:
+    findings: list[Finding] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        return [Finding(path, 0, "read_error", "low", str(exc))], []
+
+    log_type = forced_type or guess_log_type("".join(lines[:50]))
+
+    # Line-level indicator matches (applied regardless of type guess; the type
+    # just decides which indicators are relevant to avoid noise).
+    for i, line in enumerate(lines, 1):
+        for ind in LINE_INDICATORS:
+            if forced_type and forced_type not in ind.log_types:
+                continue
+            if ind.pattern.search(line):
+                findings.append(Finding(path, i, ind.id, ind.severity,
+                                        line.strip()[:300]))
+
+    # Access-log volume heuristic.
+    alerts: list[AccessAlert] = []
+    if log_type in ("access", "unknown") and forced_type != "error":
+        per_ip_large: dict[str, int] = {}
+        per_ip_total: dict[str, int] = {}
+        for line in lines:
+            m = _ACCESS_RE.search(line)
+            if not m:
+                continue
+            ip, method, _path, _status, size = m.groups()
+            if method.upper() != "POST":
+                continue
+            per_ip_total[ip] = per_ip_total.get(ip, 0) + 1
+            if size.isdigit() and int(size) >= large_bytes:
+                per_ip_large[ip] = per_ip_large.get(ip, 0) + 1
+        for ip, large in per_ip_large.items():
+            if large >= burst:
+                alerts.append(AccessAlert(path, ip, large, per_ip_total.get(ip, 0)))
+
+    return findings, alerts
+
+
+def cmd_scan_logs(args: argparse.Namespace) -> int:
+    if not args.paths:
+        print("Usage: php2shell-check scan-logs LOGFILE [LOGFILE ...] "
+              "[--type access|error|waf] [--json]", file=sys.stderr)
+        return 2
+
+    all_findings: list[Finding] = []
+    all_alerts: list[AccessAlert] = []
+    for path in args.paths:
+        f, a = scan_file(path, args.type, args.large_bytes, args.burst)
+        all_findings.extend(f)
+        all_alerts.extend(a)
+
+    if args.json:
+        print(json.dumps({
+            "cves": CVES,
+            "findings": [asdict(f) for f in all_findings],
+            "access_alerts": [asdict(a) for a in all_alerts],
+        }, indent=2))
+    else:
+        print(f"PHP2Shell log scan  ({', '.join(CVES)})\n")
+        if not all_findings and not all_alerts:
+            print("  No indicators matched.")
+            print("  NOTE: plain access logs rarely contain request bodies, so a")
+            print("  clean scan here is NOT an all-clear. For body/field detection")
+            print("  point this at WAF/ModSecurity logs, and still patch PHP.")
+            return 0
+        order = {"high": 0, "medium": 1, "low": 2}
+        for f in sorted(all_findings, key=lambda x: order.get(x.severity, 9)):
+            print(f"  [{f.severity.upper()}] {f.indicator_id}  {f.file}:{f.line_no}")
+            print(f"      {f.excerpt}")
+        for a in all_alerts:
+            print(f"  [HEURISTIC] large-POST burst from {a.ip} in {a.file}: "
+                  f"{a.large_posts} large POSTs ({a.total_posts} POSTs total)")
+        print("\n  Review context before acting; these flag attempts, not "
+              "confirmed compromise. Patch PHP regardless.")
+    return 1 if (all_findings or all_alerts) else 0
+
+
 # --- check command -----------------------------------------------------------
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -389,6 +563,20 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--conf-dir", help="PHP conf.d directory to write the ini into")
     h.add_argument("--php-binary", help="inspect a specific php binary path")
     h.set_defaults(func=cmd_harden)
+
+    s = sub.add_parser("scan-logs",
+                       help="scan web/PHP logs for PHP2Shell attack indicators")
+    s.add_argument("paths", nargs="*", help="log files to scan")
+    s.add_argument("--type", choices=("access", "error", "waf", "body"),
+                   help="force log type (default: auto-detect per file)")
+    s.add_argument("--large-bytes", type=int, default=DEFAULT_LARGE_POST_BYTES,
+                   help=f"POST size (bytes) counted as 'large' "
+                        f"(default {DEFAULT_LARGE_POST_BYTES})")
+    s.add_argument("--burst", type=int, default=DEFAULT_BURST,
+                   help=f"large-POST count from one IP to alert on "
+                        f"(default {DEFAULT_BURST})")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.set_defaults(func=cmd_scan_logs)
 
     return p
 

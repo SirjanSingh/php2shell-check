@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run tests
+        run: python -m unittest discover tests -v
+      - name: Smoke-test the CLI
+        run: |
+          python php2shell_check.py check --version 8.4.26 && exit 1 || true
+          python php2shell_check.py check --version 8.4.27
+          python php2shell_check.py check --version 8.4.26 --json
+          python php2shell_check.py harden

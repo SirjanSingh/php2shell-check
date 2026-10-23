@@ -81,6 +81,31 @@ straight into CI:
 `--apply` it writes a drop-in ini that disables `session.upload_progress` — a
 **partial** mitigation; it will still tell you to update PHP.
 
+### Scan logs for attack attempts
+
+```bash
+./php2shell_check.py scan-logs /var/log/apache2/error.log /var/log/modsec_audit.log
+./php2shell_check.py scan-logs /var/log/nginx/access.log --json
+```
+
+Read-only. It flags **attempts**, not confirmed compromise, keying on indicators
+published by security vendors after disclosure:
+
+| Indicator | Log type | Source |
+|---|---|---|
+| `PHP_SESSION_UPLOAD_PROGRESS` in a request body | WAF / ModSecurity / body | Splunk, Zafran |
+| Upload `filename=` with a `<?php` tag | WAF / body | Splunk |
+| Serialized PHP object marker (`O:..`, `a:..`) in a body | WAF / body | Splunk |
+| `PHP Fatal error … Unknown on line 0` | PHP / error log | Abstract Security |
+| Apache `AH00052` child-exit | Apache error log | Abstract Security |
+| Repeated large POSTs from one source IP | access log (heuristic) | Bitdefender, Beazley |
+
+> **Important:** plain access logs almost never record request bodies, so a clean
+> access-log scan is **not** an all-clear — the body/field indicators need a
+> WAF/ModSecurity log. And patch PHP regardless; detection is not prevention.
+> These are behavioral signals based on expected exploit behavior, not confirmed
+> atomic IoCs — validate against your own logs.
+
 ## Tests
 
 ```bash
@@ -93,6 +118,13 @@ python -m unittest discover tests
 - [Qualys — find, mitigate, and patch PHP2Shell](https://blog.qualys.com/vulnerabilities-threat-research/2026/10/20/php-announces-critical-security-release-for-two-vulnerabilities)
 - [DigitalOcean — Critical PHP RCE, patch now](https://www.digitalocean.com/blog/critical-php-rce-vulnerabilities-patch-now)
 - [Patchstack — PHP major vulnerability alert 10/2026](https://patchstack.com/articles/php-major-vulnerability-alert-10-2026/)
+
+Detection guidance:
+
+- [Splunk Research — PHP session upload progress detections](https://research.splunk.com/web/47b3ff26-c4cc-4413-9bf3-f44dbac36785/)
+- [Abstract Security — PHP2Shell log artifacts](https://www.abstract.security/blog/php2shell-critical-php-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619)
+- [Bitdefender — PHP2Shell technical advisory](https://www.bitdefender.com/en-us/blog/businessinsights/technical-advisory-php2shell-pre-auth-rce)
+- [Zafran — PHP2Shell everything you need to know](https://www.zafran.io/resources/php2shell-everything-you-need-to-know-about-the-two-critical-php-vulnerabilities)
 
 > Version/fix data in this tool reflects the 2026-10-21 release. Always confirm
 > against [php.net](https://www.php.net/) for your exact branch.
