@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: PHP security releases
+    url: https://www.php.net/releases/
+    about: Authoritative source for PHP patched versions.
+  - name: Report a security issue in this tool
+    url: https://github.com/SirjanSingh/shiny-php/security/advisories/new
+    about: Use private vulnerability reporting for anything sensitive.

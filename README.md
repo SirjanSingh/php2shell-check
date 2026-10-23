@@ -1,12 +1,27 @@
 # php2shell-check
 
+[![CI](https://github.com/SirjanSingh/shiny-php/actions/workflows/ci.yml/badge.svg)](https://github.com/SirjanSingh/shiny-php/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
+![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)
+
 Fast, zero-dependency checker and remediation helper for the **PHP2Shell** remote
 code execution flaws — **CVE-2026-109618** and **CVE-2026-109619**.
 
-> **What this is:** a *defensive* tool. It inspects the PHP install on the
-> machine it runs on, tells you whether you're affected, and gives you the exact
-> steps to fix it. It sends **no** exploit traffic and cannot be aimed at a
-> remote host. It is not an exploit and does not contain one.
+> **What this is:** a *defensive* tool. It inspects systems you operate — the
+> local PHP install, version strings, Dockerfiles/compose files, your own
+> running containers, and your own logs — tells you whether you're affected, and
+> gives you the exact steps to fix it. It sends **no** exploit traffic and cannot
+> be aimed at a remote host. It is not an exploit and does not contain one.
+
+## Respond in 60 seconds
+
+```bash
+curl -sO https://raw.githubusercontent.com/SirjanSingh/shiny-php/main/php2shell_check.py
+python3 php2shell_check.py check      # Am I affected?
+python3 php2shell_check.py harden     # If so, exact fix for my OS
+# Then update PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 and re-check.
+```
 
 ## The vulnerability
 
@@ -31,6 +46,13 @@ Single file, no dependencies, Python 3.9+:
 ```bash
 curl -O https://raw.githubusercontent.com/SirjanSingh/shiny-php/main/php2shell_check.py
 chmod +x php2shell_check.py
+```
+
+Or install it as a command with `pipx` (or `pip`):
+
+```bash
+pipx install git+https://github.com/SirjanSingh/shiny-php
+php2shell-check check
 ```
 
 ## Usage
@@ -105,6 +127,58 @@ published by security vendors after disclosure:
 > WAF/ModSecurity log. And patch PHP regardless; detection is not prevention.
 > These are behavioral signals based on expected exploit behavior, not confirmed
 > atomic IoCs — validate against your own logs.
+
+### Scan Docker images
+
+```bash
+./php2shell_check.py scan-docker                       # Dockerfiles/compose in cwd
+./php2shell_check.py scan-docker path/to/Dockerfile compose.yml
+./php2shell_check.py scan-docker --running             # + your running containers
+```
+
+Reads PHP base-image tags. A pinned tag (`php:8.3.10`) is judged exactly; a
+floating branch tag (`php:8.4`) is flagged as ambiguous (pin a patched tag),
+and an end-of-life branch tag (`php:8.1`) is flagged affected outright.
+
+### Check a whole fleet (offline)
+
+```bash
+./php2shell_check.py check --inventory hosts.txt
+```
+
+`hosts.txt` is one `label version` per line — straight from your inventory /
+Ansible facts, no network or SSH involved:
+
+```
+web01 8.3.10
+web02=8.4.27
+db01: 7.4.33
+```
+
+### SARIF → GitHub code scanning
+
+```bash
+./php2shell_check.py check --sarif > results.sarif
+./php2shell_check.py scan-logs /var/log/modsec_audit.log --sarif > results.sarif
+```
+
+Upload it so findings land in your repo's **Security** tab:
+
+```yaml
+# .github/workflows/php2shell.yml
+- run: python php2shell_check.py scan-docker --sarif > results.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
+## Why there's no remote "URL scan" mode
+
+Some PHP2Shell tools send a crafted probe to a target URL to test it. This one
+deliberately doesn't. It only inspects systems you operate (local, inventory,
+your Dockerfiles, your containers, your logs), so you can't accidentally point it
+at a host you don't own, and running it is never itself an attack. If you want to
+check a server, run it **on** that server. Full reasoning in [SECURITY.md](SECURITY.md).
 
 ## Tests
 

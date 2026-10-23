@@ -23,5 +23,24 @@ jobs:
         run: |
           python php2shell_check.py check --version 8.4.26 && exit 1 || true
           python php2shell_check.py check --version 8.4.27
-          python php2shell_check.py check --version 8.4.26 --json
+          python php2shell_check.py check --version 8.3.10 --json
+          python php2shell_check.py check --version 8.3.10 --sarif | python -c "import json,sys; json.load(sys.stdin)"
           python php2shell_check.py harden
+          printf 'FROM php:8.3.10-fpm\n' > Dockerfile.ci
+          python php2shell_check.py scan-docker Dockerfile.ci && exit 1 || true
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the package
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Install the wheel and run the entry point
+        run: |
+          python -m pip install dist/*.whl
+          php2shell-check check --version 8.4.27

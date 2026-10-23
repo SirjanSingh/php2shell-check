@@ -470,7 +470,9 @@ def cmd_scan_logs(args: argparse.Namespace) -> int:
         all_findings.extend(f)
         all_alerts.extend(a)
 
-    if args.json:
+    if getattr(args, "sarif", False):
+        print(json.dumps(scan_to_sarif(all_findings, all_alerts), indent=2))
+    elif args.json:
         print(json.dumps({
             "cves": CVES,
             "findings": [asdict(f) for f in all_findings],
@@ -496,10 +498,224 @@ def cmd_scan_logs(args: argparse.Namespace) -> int:
     return 1 if (all_findings or all_alerts) else 0
 
 
+# --- SARIF output ------------------------------------------------------------
+# SARIF lets CI upload results to GitHub code scanning (Security tab).
+
+REPO_URL = "https://github.com/SirjanSingh/shiny-php"
+_SARIF_LEVEL = {"high": "error", "medium": "warning", "low": "note"}
+
+
+def _sarif_doc(rules: list, results: list) -> dict:
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "php2shell-check",
+                "version": __version__,
+                "informationUri": REPO_URL,
+                "rules": rules,
+            }},
+            "results": results,
+        }],
+    }
+
+
+def check_to_sarif(installs: list) -> dict:
+    rule = {
+        "id": "php2shell-affected",
+        "name": "PHP2ShellAffectedVersion",
+        "shortDescription": {
+            "text": f"PHP version affected by PHP2Shell ({', '.join(CVES)})"},
+        "helpUri": REPO_URL,
+    }
+    results = [{
+        "ruleId": "php2shell-affected",
+        "level": "error",
+        "message": {"text": ins.verdict.detail},
+        "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": ins.binary}}}],
+    } for ins in installs if ins.verdict.affected]
+    return _sarif_doc([rule], results)
+
+
+def scan_to_sarif(findings: list, alerts: list) -> dict:
+    rules = [{
+        "id": ind.id, "name": ind.id,
+        "shortDescription": {"text": ind.description},
+        "helpUri": REPO_URL,
+        "properties": {"severity": ind.severity, "source": ind.source},
+    } for ind in LINE_INDICATORS]
+    rules.append({"id": "large_post_burst", "name": "large_post_burst",
+                  "shortDescription": {"text": "Large-POST burst from one source IP"},
+                  "helpUri": REPO_URL})
+    results = [{
+        "ruleId": f.indicator_id,
+        "level": _SARIF_LEVEL.get(f.severity, "warning"),
+        "message": {"text": f.excerpt},
+        "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": f.file},
+            "region": {"startLine": max(f.line_no, 1)}}}],
+    } for f in findings]
+    results.extend({
+        "ruleId": "large_post_burst",
+        "level": "warning",
+        "message": {"text": f"{a.large_posts} large POSTs from {a.ip} "
+                            f"({a.total_posts} total)"},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": a.file}}}],
+    } for a in alerts)
+    return _sarif_doc(rules, results)
+
+
+# --- fleet inventory ---------------------------------------------------------
+
+_INV_RE = re.compile(r"^\s*(?:(?P<label>[^#=:\s]+)\s*[:=\s]\s*)?(?P<ver>\d+\.\d+\.\d+)")
+
+
+def read_inventory(path: str) -> list:
+    """Parse a file of `label version`, `label=version`, or bare `version` lines
+    for offline fleet checks (no network, no SSH)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        return [PhpInstall(f"(inventory {path})", "",
+                           Verdict(None, STATUS_UNKNOWN, str(exc)))]
+    installs = []
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        m = _INV_RE.match(raw)
+        if not m:
+            continue
+        label = m.group("label") or m.group("ver")
+        installs.append(PhpInstall(label, m.group("ver"),
+                                   assess(parse_version(m.group("ver")))))
+    return installs
+
+
+# --- docker scanning ---------------------------------------------------------
+
+_PHP_IMAGE_RE = re.compile(r"\bphp:([A-Za-z0-9][A-Za-z0-9._-]*)")
+_BRANCH_RE = re.compile(r"^(\d+)\.(\d+)(?:$|[^.\d])")
+
+
+def assess_tag(tag: str) -> Verdict:
+    """Assess a Docker image tag. Full X.Y.Z is assessed exactly; a floating
+    branch tag (php:8.4) is ambiguous for supported branches and definitively
+    affected for end-of-life ones."""
+    v = parse_version(tag)
+    if v is not None:
+        return assess(v)
+    m = _BRANCH_RE.match(tag)
+    if not m:
+        return Verdict(None, STATUS_UNKNOWN,
+                       f"php:{tag} has no version in the tag — pin a full "
+                       f"patched tag (e.g. php:8.4.27).")
+    branch = (int(m.group(1)), int(m.group(2)))
+    if branch in FIXED_PATCH:
+        fixed = f"{branch[0]}.{branch[1]}.{FIXED_PATCH[branch]}"
+        return Verdict(None, STATUS_UNKNOWN,
+                       f"php:{m.group(1)}.{m.group(2)} is a floating branch tag — "
+                       f"it may or may not include the fix ({fixed}). "
+                       f"Pin php:{fixed} or later.")
+    if (5, 4) <= branch <= EOL_MAX_BRANCH:
+        return Verdict(None, STATUS_VULNERABLE_EOL,
+                       f"php:{m.group(1)}.{m.group(2)} is an end-of-life branch "
+                       f"with no official fix — move to a supported branch "
+                       f"({RECOMMENDED_UPGRADE}).")
+    return Verdict(None, STATUS_UNKNOWN,
+                   f"php:{m.group(1)}.{m.group(2)} could not be classified; "
+                   f"verify against php.net.")
+DEFAULT_DOCKER_FILES = ["Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                        "compose.yml", "compose.yaml"]
+
+
+@dataclass
+class DockerHit:
+    source: str
+    line_no: int
+    image_tag: str
+    verdict: Verdict
+
+
+def scan_docker_files(paths: list) -> list:
+    hits = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines, 1):
+            for m in _PHP_IMAGE_RE.finditer(line):
+                tag = m.group(1)
+                hits.append(DockerHit(path, i, f"php:{tag}", assess_tag(tag)))
+    return hits
+
+
+def scan_running_containers() -> tuple:
+    docker = shutil.which("docker")
+    if not docker:
+        return [], "docker CLI not found on PATH"
+    out = _run([docker, "ps", "--format", "{{.ID}} {{.Image}}"])
+    if out is None:
+        return [], "could not run `docker ps` (is the daemon running / permitted?)"
+    hits = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        cid, image = parts[0], (parts[1] if len(parts) > 1 else "?")
+        ver = parse_version(_run([docker, "exec", cid, "php", "-v"]) or "")
+        if ver is None:
+            continue
+        hits.append(DockerHit(f"container {cid} ({image})", 0, image, assess(ver)))
+    return hits, None
+
+
+def cmd_scan_docker(args: argparse.Namespace) -> int:
+    paths = args.paths or [p for p in DEFAULT_DOCKER_FILES if os.path.exists(p)]
+    hits = scan_docker_files(paths)
+    note = None
+    if args.running:
+        running, note = scan_running_containers()
+        hits.extend(running)
+
+    affected = [h for h in hits if h.verdict.affected]
+    unknown = [h for h in hits if h.verdict.status == STATUS_UNKNOWN]
+
+    if args.json:
+        print(json.dumps({"cves": CVES, "note": note, "hits": [
+            {"source": h.source, "line": h.line_no, "image": h.image_tag,
+             "version": h.verdict.version_str, "status": h.verdict.status,
+             "affected": h.verdict.affected, "detail": h.verdict.detail}
+            for h in hits]}, indent=2))
+    else:
+        print(f"PHP2Shell Docker scan  ({', '.join(CVES)})\n")
+        if note:
+            print(f"  note: {note}\n")
+        if not hits:
+            print("  No PHP images found. Pass Dockerfile/compose paths, or --running.")
+            return 0
+        for h in hits:
+            tag = ("AFFECTED" if h.verdict.affected else
+                   "OK" if h.verdict.status == STATUS_PATCHED else "UNKNOWN")
+            loc = h.source + (f":{h.line_no}" if h.line_no else "")
+            print(f"  [{tag}] {h.image_tag}  {loc}")
+            print(f"      {h.verdict.detail}")
+        if unknown:
+            print("\n  UNKNOWN = a branch tag with no patch number (e.g. php:8.3). "
+                  "Pin a full patched tag such as php:8.3.36.")
+    return 1 if affected else 0
+
+
 # --- check command -----------------------------------------------------------
 
 def cmd_check(args: argparse.Namespace) -> int:
-    if args.version:
+    if getattr(args, "inventory", None):
+        installs = read_inventory(args.inventory)
+    elif args.version:
         v = parse_version(args.version)
         verdict = assess(v)
         install = PhpInstall(binary=f"(version string: {args.version})",
@@ -509,7 +725,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         installs = [i for b in find_php_binaries(args.php_binary)
                     if (i := inspect_binary(b)) is not None]
 
-    if args.json:
+    if getattr(args, "sarif", False):
+        print(json.dumps(check_to_sarif(installs), indent=2))
+    elif args.json:
         payload = {
             "cves": CVES,
             "disclosed": DISCLOSED,
@@ -553,7 +771,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--php-binary", help="check a specific php binary path")
     c.add_argument("--version", dest="version", metavar="X.Y.Z",
                    help="assess a version string instead of a live binary")
+    c.add_argument("--inventory", metavar="FILE",
+                   help="offline fleet check: a file of `label version` lines "
+                        "(no network, no SSH)")
     c.add_argument("--json", action="store_true", help="machine-readable output")
+    c.add_argument("--sarif", action="store_true",
+                   help="SARIF output for GitHub code scanning")
     c.add_argument("--no-color", action="store_true", help="disable ANSI color")
     c.set_defaults(func=cmd_check)
 
@@ -576,7 +799,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"large-POST count from one IP to alert on "
                         f"(default {DEFAULT_BURST})")
     s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.add_argument("--sarif", action="store_true",
+                   help="SARIF output for GitHub code scanning")
     s.set_defaults(func=cmd_scan_logs)
+
+    d = sub.add_parser("scan-docker",
+                       help="scan Dockerfiles/compose files and running containers")
+    d.add_argument("paths", nargs="*",
+                   help="Dockerfile/compose paths (default: common files in cwd)")
+    d.add_argument("--running", action="store_true",
+                   help="also read PHP versions from running containers via docker")
+    d.add_argument("--json", action="store_true", help="machine-readable output")
+    d.set_defaults(func=cmd_scan_docker)
 
     return p
 
