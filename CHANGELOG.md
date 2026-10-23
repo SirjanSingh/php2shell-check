@@ -15,7 +15,10 @@ All notable changes to this project are documented here. The format is based on
   (e.g. `php:8.1`, `php:8.4`) are classified distinctly from pinned tags.
 - `scan-logs` — read-only detection of PHP2Shell exploitation *attempts* in web
   and PHP logs, using vendor-published indicators (each tagged with its source).
-- Packaging: `pip`/`pipx` installable with a `php2shell-check` entry point.
+- Packaging: `pip`/`pipx` installable with a `php2shell-check` entry point;
+  version single-sourced from the module; SPDX license metadata.
+- Automated PyPI publishing via Trusted Publishing (`release.yml`) on version
+  tags, documented in `RELEASING.md`.
 - Community health files, CI (Python 3.9/3.11/3.13 + CLI smoke test + package
   build).
 

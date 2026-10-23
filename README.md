@@ -51,9 +51,14 @@ chmod +x php2shell_check.py
 Or install it as a command with `pipx` (or `pip`):
 
 ```bash
+pipx install php2shell-check          # from PyPI (once published)
+# or straight from source, no release needed:
 pipx install git+https://github.com/SirjanSingh/shiny-php
 php2shell-check check
 ```
+
+> Maintainers: see [RELEASING.md](RELEASING.md) for the one-time PyPI
+> Trusted-Publishing setup. Tagging `vX.Y.Z` then publishes automatically.
 
 ## Usage
 
