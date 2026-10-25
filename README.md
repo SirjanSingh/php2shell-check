@@ -51,7 +51,7 @@ chmod +x php2shell_check.py
 Or install it as a command with `pipx` (or `pip`):
 
 ```bash
-pipx install php2shell-check          # from PyPI (once published)
+pipx install php2shell-check          # from PyPI
 # or straight from source, no release needed:
 pipx install git+https://github.com/SirjanSingh/shiny-php
 php2shell-check check
