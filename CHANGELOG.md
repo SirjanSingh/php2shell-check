@@ -5,7 +5,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-26
+
+First release on PyPI (`pipx install php2shell-check`).
+
 ### Added
+- `check` (detector) and `harden` (preventer) for the PHP2Shell RCE flaws
+  CVE-2026-109618 and CVE-2026-109619.
 - `check --inventory FILE` — offline fleet check from a list of `label version`
   lines (no network, no SSH).
 - `check --sarif` / `scan-logs --sarif` — SARIF 2.1.0 output for GitHub code
@@ -21,9 +27,3 @@ All notable changes to this project are documented here. The format is based on
   tags, documented in `RELEASING.md`.
 - Community health files, CI (Python 3.9/3.11/3.13 + CLI smoke test + package
   build).
-
-## [0.1.0] - 2026-10-23
-
-### Added
-- Initial release: `check` (detector) and `harden` (preventer) for the PHP2Shell
-  RCE flaws CVE-2026-109618 and CVE-2026-109619.
