@@ -4,6 +4,18 @@ Publishing is automated with [PyPI Trusted Publishing](https://docs.pypi.org/tru
 (OIDC) — no API tokens or secrets are stored in the repo. You do the one-time
 setup below once; after that every version tag publishes automatically.
 
+## Fastest path: run the setup script
+
+From a machine where `gh` is authenticated with repo-admin scope (your laptop —
+**not** the cloud session, whose proxy blocks settings writes):
+
+```bash
+./scripts/finish-setup.sh
+```
+
+It sets the repo description + topics, creates the `pypi` Actions environment,
+and prints the single PyPI step that must be done by hand (detailed below).
+
 ## One-time setup (you must do this in your own PyPI account)
 
 1. Create a PyPI account at https://pypi.org and verify your email.
