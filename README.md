@@ -10,9 +10,10 @@ code execution flaws — **CVE-2026-109618** and **CVE-2026-109619**.
 
 > **What this is:** a *defensive* tool. It inspects systems you operate — the
 > local PHP install, version strings, Dockerfiles/compose files, your own
-> running containers, and your own logs — tells you whether you're affected, and
-> gives you the exact steps to fix it. It sends **no** exploit traffic and cannot
-> be aimed at a remote host. It is not an exploit and does not contain one.
+> running containers, your own logs, and (optionally) hosts you already have SSH
+> keys for — tells you whether you're affected, and gives you the exact steps to
+> fix it. It sends **no** exploit traffic and has no URL/probe mode. It is not an
+> exploit and does not contain one.
 
 ## Respond in 60 seconds
 
@@ -57,6 +58,10 @@ pipx install git+https://github.com/SirjanSingh/shiny-php
 php2shell-check check
 ```
 
+> The restart check, `--fail-on`, `--ssh-hosts`, `rules` and the config-posture
+> report are on `main` but newer than the 0.1.0 PyPI release. Use the `curl`
+> one-liner or the `git+` install above to get them until the next release.
+
 > Maintainers: see [RELEASING.md](RELEASING.md) for the one-time PyPI
 > Trusted-Publishing setup. Tagging `vX.Y.Z` then publishes automatically.
 
@@ -78,6 +83,30 @@ PHP2Shell check  (CVE-2026-109618, CVE-2026-109619, disclosed 2026-10-21)
 Action required. Run `php2shell-check harden` for the exact upgrade steps.
 ```
 
+For an affected install it also prints the relevant `php.ini` posture
+(`session.upload_progress.enabled`, `post_max_size`, `memory_limit`, read from
+`php -i`, `php-fpm -i` included). Those settings only reduce exposure while
+you're unpatched (Elastic calls them temporary, and says `ini_set()` and
+`.user.ini` don't help); they are reported, never counted as a fix.
+
+### Did the upgrade actually take effect? (restart check)
+
+Upgrading the package fixes the files on disk, but a running php-fpm or Apache
+worker keeps executing the code it already loaded until it restarts. On Linux,
+`check` also looks at `/proc` for `php*` processes (and Apache/httpd with
+`mod_php`) whose binary or `libphp` is marked `(deleted)`:
+
+```
+Running processes
+  RESTART NEEDED  php-fpm8.4 (pid 812, 813): library replaced on disk (libphp8.4.so)
+    An upgrade is not active until the process restarts. ...
+```
+
+That counts as a failure (exit `1`) even when the version on disk is patched.
+Run it as root to see every worker; processes it can't inspect are reported, not
+skipped silently. Skip the check with `--no-restart-check`. It is not available
+on non-Linux systems, and it only sees processes in the PID namespace it runs in.
+
 ### Check a version string (no live PHP needed — great for CI / inventory)
 
 ```bash
@@ -90,11 +119,29 @@ Action required. Run `php2shell-check harden` for the exact upgrade steps.
 ./php2shell_check.py check --json
 ```
 
-Exit codes: `0` not affected · `1` affected · `2` couldn't determine. Drop it
-straight into CI:
+Exit codes: `0` not affected · `1` affected (or restart pending) · `2` couldn't
+determine. Drop it straight into CI:
 
 ```bash
 ./php2shell_check.py check --json || echo "patch PHP before shipping"
+```
+
+#### Choosing what fails the build: `--fail-on`
+
+`check`, `scan-logs` and `scan-docker` accept `--fail-on high|medium|low|none`.
+Without it the exit codes above are unchanged. With it, the command exits `1`
+only for findings at or above that level, and `0` otherwise (`none` always
+exits `0`, e.g. to report without gating).
+
+| Level | `check` | `scan-docker` | `scan-logs` |
+|---|---|---|---|
+| high | affected version, or processes still on replaced code | affected image | `high` indicators |
+| medium | version couldn't be determined | floating tag like `php:8.4` | `medium` indicators, large-POST burst |
+| low | (none) | (none) | `low` indicators |
+
+```bash
+./php2shell_check.py scan-docker --fail-on medium   # also fail on unpinned php:8.x tags
+./php2shell_check.py scan-logs error.log --fail-on high
 ```
 
 ### Remediate
@@ -152,13 +199,61 @@ and an end-of-life branch tag (`php:8.1`) is flagged affected outright.
 ```
 
 `hosts.txt` is one `label version` per line — straight from your inventory /
-Ansible facts, no network or SSH involved:
+Ansible facts, no network or SSH involved (for live hosts, see the next section):
 
 ```
 web01 8.3.10
 web02=8.4.27
 db01: 7.4.33
 ```
+
+### Check hosts over SSH
+
+```bash
+./php2shell_check.py check --ssh-hosts servers.txt           # 8 hosts at a time
+./php2shell_check.py check --ssh-hosts servers.txt --ssh-jobs 20 --fail-on high
+```
+
+`servers.txt` is one `host` or `user@host` per line (`#` comments allowed). For
+each host the tool runs `ssh -- HOST sh -s` and pipes it one fixed, read-only
+script: `php -v`, a few `php -i` ini values, and the same restart check as above.
+It writes nothing on the host and sends no exploit traffic; it is fleet
+administration for machines you already hold SSH keys for.
+
+- Key authentication only (`BatchMode=yes`). Your `known_hosts` and `~/.ssh/config`
+  apply, so unknown host keys fail instead of being auto-accepted.
+- An entry that could be read as an ssh option (leading `-`) or contains
+  whitespace is rejected, not passed on. Remote output is stripped of control
+  characters before it is printed.
+- A host that is unreachable, times out or has no PHP shows up as `UNKNOWN` with
+  the reason; with `--fail-on medium` that fails the run, by default it does not.
+- Works with `--json`, `--sarif` and `--fail-on`. The remote needs a POSIX `sh`
+  (and `/proc` for the restart check).
+
+### Generate WAF / IDS rules
+
+```bash
+./php2shell_check.py rules                              # all formats to stdout
+./php2shell_check.py rules --format modsecurity --output /etc/modsecurity/
+./php2shell_check.py rules --format suricata --block    # drop instead of alert
+```
+
+Emits ready-to-paste **ModSecurity**, **Sigma** and **Suricata** rules built from
+the same indicators `scan-logs` uses, so what you detect after the fact you can
+also flag (or block) at the edge:
+
+- Detect-only by default. `--block` switches only the specific, high-severity
+  rules (the `PHP_SESSION_UPLOAD_PROGRESS` field and a PHP tag in an upload
+  filename) to ModSecurity `deny` / Suricata `drop`; the serialized-data rule
+  stays detect-only because it is too broad to block on.
+- `--id-base` / `--sid-base` move the rule ids if they collide with yours
+  (defaults: ModSecurity `99100`, in its local-use range, and Suricata `1000100`).
+- Each file's header repeats the caveats that matter. These are a stopgap, not a
+  fix. WAFs and IDS usually inspect only a prefix of a request body (many stop at
+  64 KB), so an attacker can pad past it and a quiet rule is not an all-clear.
+  The rules assume the default `session.upload_progress.name`.
+- The rules are **not validated against a live engine** by this project. Load
+  them on a test instance, confirm they parse, and run detect-only first.
 
 ### SARIF → GitHub code scanning
 
@@ -167,29 +262,66 @@ db01: 7.4.33
 ./php2shell_check.py scan-logs /var/log/modsec_audit.log --sarif > results.sarif
 ```
 
-Upload it so findings land in your repo's **Security** tab:
+Upload it so findings land in your repo's **Security** tab. `scan-docker` has no
+SARIF output; gate it with `--fail-on` as below.
+
+### GitHub Action: gate CI on PHP2Shell
+
+Copy this into `.github/workflows/php2shell.yml`. It fails the build on affected
+base images (and, with `--fail-on medium`, on unpinned `php:8.x` tags), and
+uploads host and log findings to the **Security** tab:
 
 ```yaml
-# .github/workflows/php2shell.yml
-- run: python php2shell_check.py scan-docker --sarif > results.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: results.sarif
+name: php2shell
+on: [push, pull_request]
+
+jobs:
+  php2shell:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # for the SARIF upload
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # --fail-on, --ssh-hosts and `rules` are newer than the 0.1.0 PyPI release,
+      # so install from source until the next release is published.
+      - run: pip install git+https://github.com/SirjanSingh/shiny-php
+
+      # Fail on affected, or unpinned, PHP base images in Dockerfiles/compose files.
+      - run: php2shell-check scan-docker --fail-on medium
+
+      # Pin the version your build ships and fail if it is affected.
+      - run: php2shell-check check --version 8.4.27 --sarif > results.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
 ```
+
+Use `--fail-on none` on any step to report without failing the build.
 
 ## Why there's no remote "URL scan" mode
 
 Some PHP2Shell tools send a crafted probe to a target URL to test it. This one
-deliberately doesn't. It only inspects systems you operate (local, inventory,
-your Dockerfiles, your containers, your logs), so you can't accidentally point it
-at a host you don't own, and running it is never itself an attack. If you want to
-check a server, run it **on** that server. Full reasoning in [SECURITY.md](SECURITY.md).
+deliberately doesn't. It only inspects systems you operate: this machine, an
+inventory file, your Dockerfiles, your containers, your logs, and, with
+`--ssh-hosts`, machines you already hold SSH keys for. The SSH mode runs one
+fixed read-only script there, so you can't accidentally point it at a host you
+don't own, and running it is never itself an attack. There is no probe traffic
+and no URL mode. Full reasoning in [SECURITY.md](SECURITY.md).
 
 ## Tests
 
 ```bash
 python -m unittest discover tests
 ```
+
+The tool itself has no dependencies. If `PyYAML` happens to be installed, one
+extra test also checks that the generated Sigma rules are valid YAML. Tests that
+need Linux (`/proc`, a POSIX `sh`) are skipped elsewhere.
 
 ## Sources
 

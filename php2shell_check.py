@@ -20,12 +20,19 @@ defensive checker/preventer, not an attack tool.
 
 Usage:
     php2shell-check check [--php-binary PATH] [--version X.Y.Z] [--json]
+                          [--inventory FILE | --ssh-hosts FILE [--ssh-jobs N]]
+                          [--no-restart-check] [--fail-on LEVEL]
     php2shell-check harden [--apply] [--conf-dir DIR] [--php-binary PATH]
+    php2shell-check scan-logs LOGFILE [...] [--fail-on LEVEL]
+    php2shell-check scan-docker [PATH ...] [--running] [--fail-on LEVEL]
+    php2shell-check rules [--format modsecurity|sigma|suricata|all]
+                          [--output DIR] [--block]
 
 Exit codes (check):
     0  not affected (patched, or a branch with no known issue)
-    1  affected — action required
+    1  affected, or PHP processes still running code replaced on disk
     2  could not determine (no PHP found / unparseable version)
+--fail-on high|medium|low|none changes this to "1 only at or above that level".
 """
 
 from __future__ import annotations

@@ -7,10 +7,15 @@
 containers, and your own logs) and reports exposure to the PHP2Shell flaws
 (CVE-2026-109618 / CVE-2026-109619).
 
-It intentionally does **not** send exploit traffic and cannot be pointed at a
-remote host to actively probe it. If you want to verify a server you operate,
-run the tool on that server (or feed it that server's version/logs). Only ever
-test systems you own or are explicitly authorized to test.
+It intentionally does **not** send exploit traffic and has no URL or blackbox
+probe mode. If you want to verify a server you operate, run the tool on that
+server (or feed it that server's version/logs). The one remote mode is
+`check --ssh-hosts`, for machines you already hold SSH keys for: it runs a fixed,
+read-only script over `ssh` (key auth only, your `known_hosts` honoured, host
+entries that could be read as ssh options rejected) and writes nothing on the
+host. Only ever test systems you own or are explicitly authorized to test.
+
+`rules` only prints or writes rule files; it never contacts a host.
 
 ## This is not a substitute for patching
 
