@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -741,6 +742,229 @@ def scan_to_sarif(findings: list, alerts: list) -> dict:
     return _sarif_doc(rules, results)
 
 
+# --- rules: ready-to-paste mitigations ---------------------------------------
+#
+# `rules` turns the indicators scan-logs already uses into WAF/IDS/SIEM rules.
+# LINE_INDICATORS stays the source of truth for ids, severity, description and
+# source; _RULE_SPECS only adds the per-format expression for each one (a Python
+# regex can't be translated mechanically). A test fails if an indicator has no
+# spec, so the two cannot drift apart.
+
+RULE_REFERENCES = [
+    ("Splunk Research", "https://research.splunk.com/web/47b3ff26-c4cc-4413-9bf3-f44dbac36785/"),
+    ("Zafran", "https://www.zafran.io/resources/php2shell-everything-you-need-to-know-about-the-two-critical-php-vulnerabilities"),
+    ("Abstract Security", "https://www.abstract.security/blog/php2shell-critical-php-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619"),
+    ("ikow/php2shell-poc detection rules", "https://github.com/ikow/php2shell-poc/tree/main/detection"),
+    ("Elastic Security Labs", "https://www.elastic.co/security-labs/threat-command/php2shell-php-rce-detection"),
+]
+
+# modsec: (variable, regex[, (chained variable, chained regex)]).
+# suricata: sticky-buffer fragment. sigma: keyword groups, ANDed; each group's
+# items are ORed ('*' is Sigma's wildcard). block: safe to deny/drop with --block.
+_RULE_SPECS = {
+    "upload_progress_field": {
+        "title": "PHP_SESSION_UPLOAD_PROGRESS field in request body",
+        "modsec": ("ARGS_NAMES", r"(?i)PHP_SESSION_UPLOAD_PROGRESS", None),
+        "suricata": r'http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; nocase;',
+        "sigma": [["PHP_SESSION_UPLOAD_PROGRESS"]],
+        "block": True,
+    },
+    "php_tag_in_upload": {
+        "title": "PHP open tag in upload filename",
+        "modsec": ("FILES", r"(?i)<\?(?:php|=)", None),
+        "suricata": r'http.request_body; content:"filename="; nocase; '
+                    r'pcre:"/filename=\x22[^\x22]*<\?(?:php|=)/i";',
+        "sigma": [['filename="*<?php*', 'filename="*<?=*']],
+        "block": True,
+    },
+    # Scoped to requests that also carry the upload-progress field: a bare
+    # serialized-object marker is far too common in legitimate bodies to match alone.
+    "serialized_in_upload": {
+        "title": "Serialized PHP data alongside the upload-progress field",
+        "modsec": ("ARGS_NAMES", r"(?i)PHP_SESSION_UPLOAD_PROGRESS",
+                   ("ARGS", r"(?:O:\d+:\x22|a:\d+:\{)")),
+        "suricata": r'http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; nocase; '
+                    r'pcre:"/(?:O:\d+:\x22|a:\d+:\{)/";',
+        "sigma": [["PHP_SESSION_UPLOAD_PROGRESS"], ['O:*:"*', 'a:*:{*']],
+        "block": False,
+    },
+    "php_fatal_unknown_line0": {
+        "title": "PHP fatal error on Unknown line 0",
+        "sigma": [["Unknown on line 0"]],
+    },
+    "apache_child_exit": {
+        "title": "Apache child process exit AH00052",
+        "sigma": [["AH00052"]],
+    },
+}
+
+MODSEC_ID_BASE = 99100      # ModSecurity reserves ids 1-99999 for local rules
+SURICATA_SID_BASE = 1000100  # conventional local sid range
+BURST_COUNT, BURST_SECONDS = 3, 120
+RULE_FILENAMES = {
+    "modsecurity": "php2shell-modsecurity.conf",
+    "sigma": "php2shell-sigma.yml",
+    "suricata": "php2shell-suricata.rules",
+}
+
+
+def _rule_header(extra: list, prefix: str = "# ") -> str:
+    lines = [
+        f"php2shell-check {__version__} - rules for {', '.join(CVES)}",
+        "",
+        "These detect exploitation ATTEMPTS. They are not a fix: update PHP to",
+        "8.5.12 / 8.4.27 / 8.3.36 / 8.2.35. Test in detect-only mode first.",
+        "",
+        "Body-inspection limit: WAFs and IDS typically inspect only a prefix of a",
+        "request body (many stop at 64 KB, per the ikow/php2shell-poc detection",
+        "README), and an attacker can pad past it. A rule that stays quiet is NOT an",
+        "all-clear: raise your body-inspection limit and/or reject oversized bodies.",
+        "",
+        "Field name: the rules assume the default session.upload_progress.name,",
+        "PHP_SESSION_UPLOAD_PROGRESS. If you changed that ini setting, change the rules.",
+        "",
+        "Generated from the same indicators as `php2shell-check scan-logs`. The",
+        "syntax is not validated against a live engine by this tool: load the rules",
+        "on a test instance and check they parse before deploying.",
+    ]
+    lines += [""] + extra if extra else []
+    lines += ["", "Sources:"] + [f"  {name}: {url}" for name, url in RULE_REFERENCES]
+    return "\n".join(prefix + line if line else prefix.rstrip() for line in lines) + "\n"
+
+
+def _specs_for(fmt: str) -> list:
+    return [(ind, _RULE_SPECS[ind.id]) for ind in LINE_INDICATORS
+            if fmt in _RULE_SPECS.get(ind.id, {})]
+
+
+def render_modsecurity(block: bool = False, id_base: int = MODSEC_ID_BASE) -> str:
+    out = [_rule_header([
+        "Needs SecRuleEngine On and SecRequestBodyAccess On. Multipart field names",
+        "are read from ARGS_NAMES and upload filenames from FILES, both in phase 2.",
+        "Detect-only (pass,log) unless generated with --block; only the specific,",
+        "high-severity rules are ever switched to deny.",
+    ])]
+    for offset, (ind, spec) in enumerate(_specs_for("modsec")):
+        var, rx, chain = spec["modsec"]
+        denies = block and spec["block"] and ind.severity == "high"
+        disp = "deny,status:403" if denies else "pass"
+        tags = ",".join(f"tag:'{t}'" for t in ["php2shell", *CVES])
+        actions = (f"id:{id_base + offset},phase:2,t:none,{disp},log,auditlog,"
+                   f"severity:'CRITICAL',msg:'PHP2Shell: {spec['title']}',{tags}")
+        if chain:
+            out.append(f'SecRule {var} "@rx {rx}" \\\n    "{actions},chain"\n'
+                       f'    SecRule {chain[0]} "@rx {chain[1]}" "t:none"\n')
+        else:
+            out.append(f'SecRule {var} "@rx {rx}" \\\n    "{actions}"\n')
+    return "\n".join(out)
+
+
+def render_suricata(block: bool = False, sid_base: int = SURICATA_SID_BASE) -> str:
+    out = [_rule_header([
+        "Needs the HTTP app-layer parser and TLS terminated or decrypted upstream.",
+        "How much of a body is inspected is set by request-body-limit in the libhtp",
+        "section of suricata.yaml. `drop` only acts when Suricata runs inline (IPS);",
+        "otherwise it behaves like alert. Rules are `alert` unless generated with --block.",
+    ])]
+    refs = "reference:cve,2026-109618; reference:cve,2026-109619; "
+    sid = sid_base
+    for ind, spec in _specs_for("suricata"):
+        action = "drop" if (block and spec["block"] and ind.severity == "high") else "alert"
+        base = (f'{action} http any any -> any any (msg:"PHP2Shell: {spec["title"]}"; '
+                f'flow:established,to_server; {spec["suricata"]} '
+                f'classtype:attempted-admin; {refs}')
+        out.append(f"{base}sid:{sid}; rev:1;)")
+        sid += 1
+        if ind.id == "upload_progress_field":
+            out.append(
+                f'alert http any any -> any any (msg:"PHP2Shell: repeated '
+                f'upload-progress requests from one source"; flow:established,to_server; '
+                f'{spec["suricata"]} detection_filter:track by_src, '
+                f'count {BURST_COUNT}, seconds {BURST_SECONDS}; '
+                f'classtype:attempted-admin; {refs}sid:{sid}; rev:1;)')
+            sid += 1
+    return "\n".join(out) + "\n"
+
+
+def _yq(text: str) -> str:
+    """Single-quoted YAML scalar."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+def render_sigma() -> str:
+    docs = []
+    for ind in LINE_INDICATORS:
+        spec = _RULE_SPECS.get(ind.id)
+        if not spec or "sigma" not in spec:
+            continue
+        rid = uuid.uuid5(uuid.NAMESPACE_URL, f"{REPO_URL}/sigma/{ind.id}")
+        lines = [
+            f"title: {_yq('PHP2Shell - ' + spec['title'])}",
+            f"id: {rid}",
+            "status: experimental",
+            f"description: {_yq(ind.description)}",
+            "references:",
+            *[f"  - {url}" for _, url in RULE_REFERENCES],
+            "author: php2shell-check",
+            f"date: {DISCLOSED}",
+            "tags:",
+            "  - attack.initial-access",
+            "  - attack.t1190",
+            *[f"  - cve.{c[4:].lower()}" for c in CVES],
+            "logsource:",
+            "  category: webserver  # map to the WAF / web / PHP error log in your pipeline",
+            "detection:",
+        ]
+        names = []
+        for n, group in enumerate(spec["sigma"], 1):
+            name = f"kw{n}"
+            names.append(name)
+            lines.append(f"  {name}:")
+            lines += [f"    - {_yq(item)}" for item in group]
+        lines += [f"  condition: {' and '.join(names)}",
+                  "falsepositives:",
+                  f"  - {_yq('Legitimate use is rare; review context before acting.')}",
+                  f"level: {ind.severity}"]
+        docs.append("\n".join(lines) + "\n")
+    return _rule_header([
+        "One Sigma rule per YAML document. Field-less keyword searches are used",
+        "because Sigma has no standard request-body field; convert with your backend.",
+    ]) + "---\n" + "---\n".join(docs)
+
+
+_RENDERERS = {"modsecurity": render_modsecurity, "sigma": render_sigma,
+              "suricata": render_suricata}
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    formats = list(_RENDERERS) if args.format == "all" else [args.format]
+    rendered = {}
+    for fmt in formats:
+        if fmt == "modsecurity":
+            rendered[fmt] = render_modsecurity(args.block, args.id_base)
+        elif fmt == "suricata":
+            rendered[fmt] = render_suricata(args.block, args.sid_base)
+        else:
+            rendered[fmt] = render_sigma()
+    if args.output:
+        try:
+            os.makedirs(args.output, exist_ok=True)
+            for fmt, text in rendered.items():
+                path = os.path.join(args.output, RULE_FILENAMES[fmt])
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                print(f"Wrote {path}")
+        except OSError as exc:
+            print(f"Failed to write rules: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    for fmt, text in rendered.items():
+        if len(rendered) > 1:
+            print(f"# ===== {RULE_FILENAMES[fmt]} =====")
+        print(text)
+    return 0
+
+
 # --- fleet inventory ---------------------------------------------------------
 
 _INV_RE = re.compile(r"^\s*(?:(?P<label>[^#=:\s]+)\s*[:=\s]\s*)?(?P<ver>\d+\.\d+\.\d+)")
@@ -1049,6 +1273,21 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--json", action="store_true", help="machine-readable output")
     add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
+
+    r = sub.add_parser("rules",
+                       help="emit ready-to-paste ModSecurity / Sigma / Suricata rules")
+    r.add_argument("--format", choices=("modsecurity", "sigma", "suricata", "all"),
+                   default="all", help="rule format (default: all)")
+    r.add_argument("--output", metavar="DIR",
+                   help="write one file per format into DIR instead of printing")
+    r.add_argument("--block", action="store_true",
+                   help="ModSecurity deny / Suricata drop for the specific high-severity "
+                        "rules instead of detect-only")
+    r.add_argument("--id-base", type=int, default=MODSEC_ID_BASE,
+                   help=f"first ModSecurity rule id (default {MODSEC_ID_BASE})")
+    r.add_argument("--sid-base", type=int, default=SURICATA_SID_BASE,
+                   help=f"first Suricata sid (default {SURICATA_SID_BASE})")
+    r.set_defaults(func=cmd_rules)
 
     return p
 

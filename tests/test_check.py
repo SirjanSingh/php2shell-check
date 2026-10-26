@@ -4,9 +4,16 @@
 import contextlib
 import io
 import os
+import re
 import sys
 import unittest
+import uuid
 from unittest import mock
+
+try:  # optional: validates the generated Sigma rules when available
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,7 +34,13 @@ from php2shell_check import (  # noqa: E402
     exit_code_for,
     check_exit_code,
     find_stale_php_processes,
+    render_modsecurity,
+    render_suricata,
+    render_sigma,
     main,
+    LINE_INDICATORS,
+    RULE_FILENAMES,
+    _RULE_SPECS,
     PhpInstall,
     StaleProcess,
     STATUS_PATCHED,
@@ -367,6 +380,102 @@ class StaleProcessTests(unittest.TestCase):
         self.assertEqual(check_exit_code([ok], "none", local_stale=True), 0)
         results = check_to_sarif([ok], [sp])["runs"][0]["results"]
         self.assertEqual([r["ruleId"] for r in results], ["php2shell-restart-pending"])
+
+
+class RulesTests(unittest.TestCase):
+    def test_every_indicator_has_a_rule_spec(self):
+        for ind in LINE_INDICATORS:
+            with self.subTest(indicator=ind.id):
+                spec = _RULE_SPECS.get(ind.id)
+                self.assertIsNotNone(spec, "add a _RULE_SPECS entry for this indicator")
+                self.assertTrue({"modsec", "suricata", "sigma"} & set(spec))
+
+    def test_header_carries_the_caveats(self):
+        for text in (render_modsecurity(), render_suricata(), render_sigma()):
+            self.assertIn("CVE-2026-109618", text)
+            self.assertIn("not a fix", text)
+            self.assertIn("64 KB", text)
+            self.assertIn("PHP_SESSION_UPLOAD_PROGRESS", text)
+            self.assertIn("not validated against a live engine", text)
+
+    def test_modsecurity_detect_only_by_default(self):
+        text = render_modsecurity()
+        self.assertNotIn("deny,status", text)
+        ids = re.findall(r"id:(\d+),", text)
+        self.assertEqual(ids, ["99100", "99101", "99102"])
+        self.assertIn('SecRule ARGS_NAMES "@rx (?i)PHP_SESSION_UPLOAD_PROGRESS"', text)
+        self.assertIn('SecRule FILES "@rx (?i)<\\?(?:php|=)"', text)
+
+    def test_modsecurity_block_only_specific_rules(self):
+        text = render_modsecurity(block=True, id_base=77000)
+        rules = text.split("SecRule ")[1:]
+        denying = [r for r in rules if "deny,status:403" in r]
+        self.assertEqual(len(denying), 2)
+        self.assertEqual(len(re.findall(r"id:77\d{3},", text)), 3)
+        chained = [r for r in rules if r.startswith("ARGS_NAMES") and "chain" in r][0]
+        self.assertNotIn("deny", chained)
+        self.assertIn("SecRule ARGS", text.split("chain\"")[1])
+
+    def test_suricata_rules_are_well_formed(self):
+        for block in (False, True):
+            lines = [ln for ln in render_suricata(block=block).splitlines()
+                     if ln and not ln.startswith("#")]
+            self.assertEqual(len(lines), 4)
+            sids = [re.search(r"sid:(\d+);", ln).group(1) for ln in lines]
+            self.assertEqual(len(set(sids)), len(sids))
+            for ln in lines:
+                self.assertRegex(ln, r"^(alert|drop) http any any -> any any \(")
+                self.assertTrue(ln.endswith(")"))
+                self.assertEqual(ln.count('"') % 2, 0)
+                self.assertIn("http.request_body;", ln)
+                self.assertIn("flow:established,to_server;", ln)
+            self.assertEqual(sum(ln.startswith("drop") for ln in lines),
+                             2 if block else 0)
+        self.assertIn("detection_filter:track by_src, count 3, seconds 120;",
+                      render_suricata())
+
+    def test_sigma_documents(self):
+        text = render_sigma()
+        self.assertEqual(text, render_sigma())  # deterministic
+        docs = [d for d in text.split("---\n")[1:]]
+        self.assertEqual(len(docs), len(LINE_INDICATORS))
+        ids = [re.search(r"^id: (\S+)$", d, re.M).group(1) for d in docs]
+        self.assertEqual(len(set(ids)), len(ids))
+        for rid in ids:
+            uuid.UUID(rid)
+        for d in docs:
+            for key in ("title:", "logsource:", "detection:", "condition:", "level:"):
+                self.assertIn(key, d)
+
+    @unittest.skipUnless(yaml, "PyYAML not installed")
+    def test_sigma_is_valid_yaml(self):
+        docs = list(yaml.safe_load_all(render_sigma()))
+        self.assertEqual(len(docs), len(LINE_INDICATORS))
+        by_title = {d["title"]: d for d in docs}
+        d = by_title["PHP2Shell - Serialized PHP data alongside the upload-progress field"]
+        self.assertEqual(d["detection"]["condition"], "kw1 and kw2")
+        self.assertEqual(d["detection"]["kw2"], ['O:*:"*', 'a:*:{*'])
+        self.assertEqual(d["level"], "high")
+        self.assertIn("cve.2026-109619", d["tags"])
+
+    def test_cli_rules_stdout_and_output_dir(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(main(["rules", "--format", "suricata"]), 0)
+        self.assertIn("sid:1000100;", buf.getvalue())
+        with tempfile.TemporaryDirectory() as tmp, \
+                contextlib.redirect_stdout(io.StringIO()):
+            out = os.path.join(tmp, "rules")
+            self.assertEqual(main(["rules", "--output", out, "--block"]), 0)
+            self.assertEqual(sorted(os.listdir(out)), sorted(RULE_FILENAMES.values()))
+            with open(os.path.join(out, "php2shell-modsecurity.conf")) as fh:
+                self.assertIn("deny,status:403", fh.read())
+
+    def test_cli_rules_unwritable_output(self):
+        with tempfile.NamedTemporaryFile() as fh, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            # a file where the output directory should be
+            self.assertEqual(main(["rules", "--output", fh.name]), 2)
 
 
 class FailOnTests(unittest.TestCase):
