@@ -1,6 +1,8 @@
 """Tests for php2shell-check version/verdict logic. Run: python -m pytest, or
    python -m unittest discover tests."""
 
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -19,6 +21,11 @@ from php2shell_check import (  # noqa: E402
     check_to_sarif,
     scan_to_sarif,
     guess_log_type,
+    parse_ini_posture,
+    posture_notes,
+    exit_code_for,
+    check_exit_code,
+    main,
     PhpInstall,
     STATUS_PATCHED,
     STATUS_VULNERABLE,
@@ -221,6 +228,86 @@ class SarifTests(unittest.TestCase):
         doc = scan_to_sarif(findings, alerts)
         self.assertEqual(doc["version"], "2.1.0")
         self.assertGreaterEqual(len(doc["runs"][0]["results"]), 1)
+
+
+PHP_I_SAMPLE = """\
+phpinfo()
+memory_limit => 128M => 128M
+post_max_size => 8M => 8M
+session.upload_progress.cleanup => On => On
+session.upload_progress.enabled => On => On
+fatal_error_backtraces => On => On
+"""
+
+
+class PostureTests(unittest.TestCase):
+    def test_parse_ini_posture(self):
+        cfg = parse_ini_posture(PHP_I_SAMPLE)
+        self.assertEqual(cfg["memory_limit"], "128M")
+        self.assertEqual(cfg["post_max_size"], "8M")
+        self.assertEqual(cfg["session.upload_progress.enabled"], "On")
+        self.assertEqual(cfg["session.upload_progress.cleanup"], "On")
+
+    def test_parse_uses_local_value_and_ignores_missing(self):
+        cfg = parse_ini_posture("memory_limit => -1 => 128M\n")
+        self.assertEqual(cfg, {"memory_limit": "-1"})
+
+    def test_parse_empty(self):
+        self.assertEqual(parse_ini_posture(""), {})
+
+    def test_notes_only_for_affected(self):
+        cfg = parse_ini_posture(PHP_I_SAMPLE)
+        bad = PhpInstall("php", "8.5.1", assess((8, 5, 1)), True, cfg)
+        good = PhpInstall("php", "8.5.12", assess((8, 5, 12)), True, cfg)
+        text = " ".join(posture_notes(bad))
+        self.assertIn("memory_limit=128M", text)
+        self.assertIn("PARTIAL", text)
+        self.assertIn("fatal_error_backtraces", text)  # 8.5 only
+        self.assertEqual(posture_notes(good), [])
+
+    def test_backtraces_note_is_8_5_only(self):
+        cfg = parse_ini_posture(PHP_I_SAMPLE)
+        ins = PhpInstall("php", "8.4.1", assess((8, 4, 1)), True, cfg)
+        self.assertNotIn("fatal_error_backtraces", " ".join(posture_notes(ins)))
+
+
+class FailOnTests(unittest.TestCase):
+    def test_default_keeps_historical_code(self):
+        self.assertEqual(exit_code_for(["low"], None, 1), 1)
+        self.assertEqual(exit_code_for([], None, 0), 0)
+
+    def test_threshold_matrix(self):
+        self.assertEqual(exit_code_for(["medium"], "high", 1), 0)
+        self.assertEqual(exit_code_for(["high"], "high", 0), 1)
+        self.assertEqual(exit_code_for(["low"], "medium", 1), 0)
+        self.assertEqual(exit_code_for(["medium"], "low", 0), 1)
+        self.assertEqual(exit_code_for([], "low", 1), 0)
+
+    def test_none_never_fails(self):
+        self.assertEqual(exit_code_for(["high"], "none", 1), 0)
+
+    def test_check_exit_codes(self):
+        bad = PhpInstall("a", "8.4.26", assess((8, 4, 26)))
+        ok = PhpInstall("b", "8.4.27", assess((8, 4, 27)))
+        unk = PhpInstall("c", "", assess(None))
+        self.assertEqual(check_exit_code([bad], None), 1)
+        self.assertEqual(check_exit_code([ok], None), 0)
+        self.assertEqual(check_exit_code([unk], None), 2)
+        self.assertEqual(check_exit_code([], None), 2)
+        self.assertEqual(check_exit_code([unk], "high"), 0)
+        self.assertEqual(check_exit_code([unk], "medium"), 1)
+        self.assertEqual(check_exit_code([bad], "none"), 0)
+        self.assertEqual(check_exit_code([], "high"), 2)
+        self.assertEqual(check_exit_code([], "none"), 0)
+
+    def test_cli_fail_on(self):
+        # --version path needs no PHP binary
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["check", "--version", "8.4.26", "--no-color"]), 1)
+            self.assertEqual(main(["check", "--version", "8.4.26", "--no-color",
+                                   "--fail-on", "none"]), 0)
+            self.assertEqual(main(["check", "--version", "8.4.27", "--no-color",
+                                   "--fail-on", "low"]), 0)
 
 
 if __name__ == "__main__":

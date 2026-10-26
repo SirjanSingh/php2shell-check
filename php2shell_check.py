@@ -157,6 +157,8 @@ class PhpInstall:
     raw_version: str
     verdict: Verdict
     upload_progress_enabled: Optional[bool] = None
+    config: dict = field(default_factory=dict)
+    stale: list = field(default_factory=list)
 
 
 def _run(cmd: list[str]) -> Optional[str]:
@@ -180,15 +182,38 @@ def find_php_binaries(explicit: Optional[str] = None) -> list[str]:
     return found
 
 
-def _upload_progress_enabled(binary: str) -> Optional[bool]:
-    """Read session.upload_progress.enabled from `php -i`. None if unknown."""
+# php.ini settings worth surfacing. They only reduce exposure while PHP is
+# unpatched; none of them is a fix (see posture_notes).
+POSTURE_KEYS = (
+    "session.upload_progress.enabled",
+    "session.upload_progress.cleanup",
+    "post_max_size",
+    "memory_limit",
+    "fatal_error_backtraces",
+)
+
+
+def parse_ini_posture(text: str) -> dict:
+    """Pull POSTURE_KEYS out of `php -i` text. `php -i` prints
+    `key => local value => master value`; the local (effective) value is kept."""
+    out = {}
+    for key in POSTURE_KEYS:
+        m = re.search(rf"^{re.escape(key)}\s*=>\s*([^=\n]*?)\s*(?:=>|$)",
+                      text, re.MULTILINE)
+        if m:
+            out[key] = m.group(1).strip()
+    return out
+
+
+def _ini_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    return value.strip().lower() in ("on", "1", "enabled", "true", "yes")
+
+
+def read_ini_posture(binary: str) -> dict:
     text = _run([binary, "-i"])
-    if text is None:
-        return None
-    m = re.search(r"session\.upload_progress\.enabled\s*=>\s*(\w+)", text)
-    if not m:
-        return None
-    return m.group(1).strip().lower() in ("on", "1", "enabled", "true")
+    return parse_ini_posture(text) if text else {}
 
 
 def inspect_binary(binary: str) -> Optional[PhpInstall]:
@@ -198,9 +223,11 @@ def inspect_binary(binary: str) -> Optional[PhpInstall]:
     verdict = assess(parse_version(raw))
     install = PhpInstall(binary=binary, raw_version=raw.strip().splitlines()[0] if raw.strip() else "",
                          verdict=verdict)
-    # Only bother reading the full config for the CLI-style binaries.
-    if os.path.basename(binary).startswith("php") and "fpm" not in os.path.basename(binary):
-        install.upload_progress_enabled = _upload_progress_enabled(binary)
+    # `php-fpm -i` reports the FPM SAPI's ini, which can differ from the CLI's.
+    if os.path.basename(binary).startswith("php"):
+        install.config = read_ini_posture(binary)
+        install.upload_progress_enabled = _ini_bool(
+            install.config.get("session.upload_progress.enabled"))
     return install
 
 
@@ -211,6 +238,32 @@ def _c(text: str, color: str, use_color: bool) -> str:
         return text
     codes = {"red": "31", "green": "32", "yellow": "33", "bold": "1"}
     return f"\033[{codes[color]}m{text}\033[0m"
+
+
+def posture_notes(ins: PhpInstall) -> list[str]:
+    """Config-posture lines for an affected install. These describe temporary
+    exposure reduction (per Elastic's relay of the PHP security team's guidance),
+    never a fix, so they are only shown while the install is still affected."""
+    cfg = ins.config
+    if not cfg or not ins.verdict.affected:
+        return []
+    notes = []
+    shown = [f"{k}={cfg[k]}" for k in
+             ("session.upload_progress.enabled", "post_max_size", "memory_limit")
+             if k in cfg]
+    if shown:
+        notes.append("config: " + "  ".join(shown))
+    if ins.upload_progress_enabled is True:
+        notes.append("session.upload_progress.enabled is On — this is the "
+                     "confirmed exploit path. Disabling it is a PARTIAL workaround only.")
+    if (ins.verdict.version or ())[:2] == (8, 5) and _ini_bool(cfg.get("fatal_error_backtraces")):
+        notes.append("fatal_error_backtraces is on; Elastic advises 0 on PHP 8.5 "
+                     "as a temporary measure.")
+    if shown:
+        notes.append("settings like these only reduce exposure and must be set in "
+                     "php.ini / the FPM pool / server config (ini_set() and "
+                     ".user.ini do not help). Update PHP.")
+    return notes
 
 
 def print_human(installs: list[PhpInstall], use_color: bool) -> None:
@@ -232,9 +285,8 @@ def print_human(installs: list[PhpInstall], use_color: bool) -> None:
         print(f"  {ins.binary}")
         print(f"    {ins.raw_version}")
         print(f"    {tag}: {v.detail}")
-        if ins.upload_progress_enabled is True and v.affected:
-            print("    note: session.upload_progress.enabled is On — this is the "
-                  "confirmed exploit path. Disabling it is a PARTIAL workaround only.")
+        for note in posture_notes(ins):
+            print(f"    note: {note}")
         print()
 
     if any(i.verdict.affected for i in installs):
@@ -495,7 +547,8 @@ def cmd_scan_logs(args: argparse.Namespace) -> int:
                   f"{a.large_posts} large POSTs ({a.total_posts} POSTs total)")
         print("\n  Review context before acting; these flag attempts, not "
               "confirmed compromise. Patch PHP regardless.")
-    return 1 if (all_findings or all_alerts) else 0
+    return exit_code_for([f.severity for f in all_findings] + ["medium"] * len(all_alerts),
+                         args.fail_on, 1 if (all_findings or all_alerts) else 0)
 
 
 # --- SARIF output ------------------------------------------------------------
@@ -707,7 +760,57 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
         if unknown:
             print("\n  UNKNOWN = a branch tag with no patch number (e.g. php:8.3). "
                   "Pin a full patched tag such as php:8.3.36.")
-    return 1 if affected else 0
+    sevs = ["high" if h.verdict.affected else "medium"
+            for h in hits if h.verdict.affected or h.verdict.status == STATUS_UNKNOWN]
+    return exit_code_for(sevs, args.fail_on, 1 if affected else 0)
+
+
+# --- exit codes / --fail-on --------------------------------------------------
+
+FAIL_ON_CHOICES = ("high", "medium", "low", "none")
+_SEV_RANK = {"low": 1, "medium": 2, "high": 3}
+
+
+def exit_code_for(severities: list, fail_on: Optional[str], default: int) -> int:
+    """Exit 1 when any severity reaches the --fail-on threshold, else 0.
+    No --fail-on keeps each command's historical exit code (`default`);
+    `none` never fails."""
+    if fail_on is None:
+        return default
+    if fail_on == "none":
+        return 0
+    threshold = _SEV_RANK[fail_on]
+    return 1 if any(_SEV_RANK.get(s, 0) >= threshold for s in severities) else 0
+
+
+def install_severity(ins: PhpInstall) -> Optional[str]:
+    """high = affected (or still running replaced code); medium = undetermined."""
+    if ins.verdict.affected or ins.stale:
+        return "high"
+    if ins.verdict.status == STATUS_UNKNOWN:
+        return "medium"
+    return None
+
+
+def check_exit_code(installs: list, fail_on: Optional[str]) -> int:
+    if not installs:
+        default = 2
+    elif any(i.verdict.affected or i.stale for i in installs):
+        default = 1
+    elif all(i.verdict.status == STATUS_UNKNOWN for i in installs):
+        default = 2
+    else:
+        default = 0
+    if not installs and fail_on not in (None, "none"):
+        return 2  # nothing was checked, so a threshold can't be evaluated
+    return exit_code_for([install_severity(i) for i in installs], fail_on, default)
+
+
+def add_fail_on(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--fail-on", choices=FAIL_ON_CHOICES, metavar="LEVEL",
+        help="exit 1 only for findings at or above LEVEL (high|medium|low), or "
+             "'none' to always exit 0. Default: the command's usual exit codes")
 
 
 # --- check command -----------------------------------------------------------
@@ -739,6 +842,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "affected": i.verdict.affected,
                     "fixed_version": i.verdict.fixed_version,
                     "upload_progress_enabled": i.upload_progress_enabled,
+                    "config": i.config,
                     "detail": i.verdict.detail,
                 }
                 for i in installs
@@ -748,13 +852,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         print_human(installs, use_color=sys.stdout.isatty() and not args.no_color)
 
-    if not installs:
-        return 2
-    if any(i.verdict.affected for i in installs):
-        return 1
-    if all(i.verdict.status == STATUS_UNKNOWN for i in installs):
-        return 2
-    return 0
+    return check_exit_code(installs, args.fail_on)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -778,6 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")
     c.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    add_fail_on(c)
     c.set_defaults(func=cmd_check)
 
     h = sub.add_parser("harden", help="show/apply remediation steps")
@@ -801,6 +900,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")
+    add_fail_on(s)
     s.set_defaults(func=cmd_scan_logs)
 
     d = sub.add_parser("scan-docker",
@@ -810,6 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--running", action="store_true",
                    help="also read PHP versions from running containers via docker")
     d.add_argument("--json", action="store_true", help="machine-readable output")
+    add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
 
     return p
