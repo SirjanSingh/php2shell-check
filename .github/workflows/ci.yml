@@ -18,16 +18,43 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run tests
-        run: python -m unittest discover tests -v
+        run: |
+          # PyYAML is optional; with it the Sigma-rule test validates real YAML.
+          python -m pip install pyyaml
+          python -m unittest discover tests -v
       - name: Smoke-test the CLI
         run: |
           python php2shell_check.py check --version 8.4.26 && exit 1 || true
           python php2shell_check.py check --version 8.4.27
-          python php2shell_check.py check --version 8.3.10 --json
+          # 8.3.10 is affected, so these exit 1; assert on the output instead.
+          python php2shell_check.py check --version 8.3.10 --json | python -c "import json,sys; assert json.load(sys.stdin)['installs'][0]['affected']"
           python php2shell_check.py check --version 8.3.10 --sarif | python -c "import json,sys; json.load(sys.stdin)"
+          python php2shell_check.py check --version 8.4.26 --fail-on none
           python php2shell_check.py harden
           printf 'FROM php:8.3.10-fpm\n' > Dockerfile.ci
           python php2shell_check.py scan-docker Dockerfile.ci && exit 1 || true
+          printf 'FROM php:8.3\n' > Dockerfile.float
+          python php2shell_check.py scan-docker Dockerfile.float --fail-on high
+          python php2shell_check.py scan-docker Dockerfile.float --fail-on medium && exit 1 || true
+          python php2shell_check.py rules > /dev/null
+          python php2shell_check.py rules --output rules-out --block
+          test -s rules-out/php2shell-modsecurity.conf
+          test -s rules-out/php2shell-sigma.yml
+          test -s rules-out/php2shell-suricata.rules
+          printf -- '-oProxyCommand=x\n' > bad-hosts.txt
+          python php2shell_check.py check --ssh-hosts bad-hosts.txt --fail-on high
+          python php2shell_check.py check --ssh-hosts bad-hosts.txt --fail-on medium && exit 1 || true
+      - name: Restart check against a real replaced process
+        run: |
+          cp /bin/sleep /tmp/phpx
+          /tmp/phpx 60 &
+          PHPX_PID=$!
+          sleep 1
+          rm /tmp/phpx
+          python php2shell_check.py check --no-color && exit 1 || true
+          python php2shell_check.py check --json | python -c "import json,sys; d=json.load(sys.stdin); assert [s['name'] for s in d['stale_processes']] == ['phpx'], d"
+          python php2shell_check.py check --no-restart-check --fail-on none
+          kill "$PHPX_PID"
 
   build:
     runs-on: ubuntu-latest
