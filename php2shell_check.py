@@ -231,6 +231,96 @@ def inspect_binary(binary: str) -> Optional[PhpInstall]:
     return install
 
 
+# --- restart awareness -------------------------------------------------------
+#
+# Upgrading the package fixes the file on disk, but a running php-fpm/Apache
+# worker keeps executing the code it already mapped until it is restarted. When
+# the package manager replaces a file it unlinks the old one, so a still-running
+# process shows the old path as "(deleted)" in /proc/<pid>/exe or /proc/<pid>/maps.
+
+@dataclass
+class StaleProcess:
+    name: str
+    pids: list
+    reason: str
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _stale_reason(base: str, check_exe: bool) -> Optional[str]:
+    """Why the process at /proc/<pid> still runs replaced PHP code, or None.
+    Raises PermissionError when /proc/<pid>/exe or maps is not readable."""
+    if check_exe:
+        try:
+            target = os.readlink(os.path.join(base, "exe"))
+        except PermissionError:
+            raise
+        except OSError:
+            target = ""  # e.g. a zombie has no exe link; maps may still tell
+        if target.endswith(" (deleted)"):
+            return f"binary replaced on disk ({target[:-len(' (deleted)')]})"
+    for line in _read_text(os.path.join(base, "maps")).splitlines():
+        if not line.endswith(" (deleted)"):
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        name = os.path.basename(parts[5][:-len(" (deleted)")])
+        if name.startswith(("php", "libphp")):
+            return f"library replaced on disk ({name})"
+    return None
+
+
+def find_stale_php_processes(proc_root: str = "/proc") -> tuple:
+    """Find php-fpm/php-cgi (and mod_php Apache) processes still running PHP
+    code that has been replaced on disk. Returns (list[StaleProcess], note).
+    Linux only; `proc_root` is injectable for tests."""
+    if not os.path.isdir(proc_root):
+        return [], "restart check needs Linux /proc, which is not available here"
+    groups: dict = {}
+    denied = 0
+    for entry in os.listdir(proc_root):
+        if not entry.isdigit():
+            continue
+        base = os.path.join(proc_root, entry)
+        try:
+            comm = _read_text(os.path.join(base, "comm")).strip()
+        except OSError:
+            continue  # exited while we were walking /proc
+        is_php = comm.startswith("php")
+        if not (is_php or comm in ("apache2", "httpd")):
+            continue
+        try:
+            reason = _stale_reason(base, check_exe=is_php)
+        except PermissionError:
+            denied += 1
+            continue
+        except OSError:
+            continue
+        if reason:
+            groups.setdefault((comm, reason), []).append(int(entry))
+    stale = [StaleProcess(name, sorted(pids), reason)
+             for (name, reason), pids in sorted(groups.items())]
+    note = None
+    if denied:
+        note = (f"{denied} PHP/web process(es) could not be inspected "
+                f"(permission denied) — run as root to see all workers")
+    return stale, note
+
+
+def print_stale(stale: list, use_color: bool, indent: str = "  ") -> None:
+    for sp in stale:
+        pids = ", ".join(map(str, sp.pids[:8])) + (", ..." if len(sp.pids) > 8 else "")
+        print(indent + _c("RESTART NEEDED", "red", use_color) +
+              f"  {sp.name} (pid {pids}): {sp.reason}")
+    if stale:
+        print(indent + "  An upgrade is not active until the process restarts. Restart "
+                       "php-fpm / apache2 / your PHP service, then re-check.")
+
+
 # --- Output -----------------------------------------------------------------
 
 def _c(text: str, color: str, use_color: bool) -> str:
@@ -266,14 +356,18 @@ def posture_notes(ins: PhpInstall) -> list[str]:
     return notes
 
 
-def print_human(installs: list[PhpInstall], use_color: bool) -> None:
+def print_human(installs: list[PhpInstall], use_color: bool,
+                stale: Optional[list] = None, stale_note: Optional[str] = None) -> None:
+    """`stale`/`stale_note` are the local restart-check results; remote hosts
+    carry theirs on each PhpInstall."""
+    stale = stale or []
     print(_c("PHP2Shell check", "bold", use_color) +
           f"  ({', '.join(CVES)}, disclosed {DISCLOSED})")
     print()
     if not installs:
         print(_c("No PHP binary found on PATH.", "yellow", use_color))
         print("Pass --php-binary /path/to/php, or --version X.Y.Z to check a version string.")
-        return
+        print()
     for ins in installs:
         v = ins.verdict
         if v.status == STATUS_PATCHED:
@@ -287,11 +381,23 @@ def print_human(installs: list[PhpInstall], use_color: bool) -> None:
         print(f"    {tag}: {v.detail}")
         for note in posture_notes(ins):
             print(f"    note: {note}")
+        print_stale(ins.stale, use_color, indent="    ")
+        print()
+
+    if stale:
+        print(_c("Running processes", "bold", use_color))
+        print_stale(stale, use_color)
+        print()
+    if stale_note:
+        print(f"  note: {stale_note}")
         print()
 
     if any(i.verdict.affected for i in installs):
         print(_c("Action required.", "red", use_color) +
               " Run `php2shell-check harden` for the exact upgrade steps.")
+    elif stale or any(i.stale for i in installs):
+        print(_c("Restart required.", "red", use_color) +
+              " Processes are still running PHP code that was replaced on disk.")
 
 
 # --- harden / preventer ------------------------------------------------------
@@ -574,12 +680,19 @@ def _sarif_doc(rules: list, results: list) -> dict:
     }
 
 
-def check_to_sarif(installs: list) -> dict:
+def check_to_sarif(installs: list, stale: Optional[list] = None) -> dict:
     rule = {
         "id": "php2shell-affected",
         "name": "PHP2ShellAffectedVersion",
         "shortDescription": {
             "text": f"PHP version affected by PHP2Shell ({', '.join(CVES)})"},
+        "helpUri": REPO_URL,
+    }
+    restart_rule = {
+        "id": "php2shell-restart-pending",
+        "name": "PHP2ShellRestartPending",
+        "shortDescription": {
+            "text": "PHP process still running code that was replaced on disk"},
         "helpUri": REPO_URL,
     }
     results = [{
@@ -589,7 +702,15 @@ def check_to_sarif(installs: list) -> dict:
         "locations": [{"physicalLocation": {
             "artifactLocation": {"uri": ins.binary}}}],
     } for ins in installs if ins.verdict.affected]
-    return _sarif_doc([rule], results)
+    pending = [(ins.binary, sp) for ins in installs for sp in ins.stale]
+    pending += [("(local processes)", sp) for sp in (stale or [])]
+    results.extend({
+        "ruleId": "php2shell-restart-pending",
+        "level": "error",
+        "message": {"text": f"{sp.name} (pid {', '.join(map(str, sp.pids))}): {sp.reason}"},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": where}}}],
+    } for where, sp in pending)
+    return _sarif_doc([rule, restart_rule], results)
 
 
 def scan_to_sarif(findings: list, alerts: list) -> dict:
@@ -792,18 +913,19 @@ def install_severity(ins: PhpInstall) -> Optional[str]:
     return None
 
 
-def check_exit_code(installs: list, fail_on: Optional[str]) -> int:
-    if not installs:
-        default = 2
-    elif any(i.verdict.affected or i.stale for i in installs):
+def check_exit_code(installs: list, fail_on: Optional[str],
+                    local_stale: bool = False) -> int:
+    """`local_stale`: the local restart check found workers on replaced code."""
+    if any(i.verdict.affected or i.stale for i in installs) or local_stale:
         default = 1
-    elif all(i.verdict.status == STATUS_UNKNOWN for i in installs):
+    elif not installs or all(i.verdict.status == STATUS_UNKNOWN for i in installs):
         default = 2
     else:
         default = 0
-    if not installs and fail_on not in (None, "none"):
+    if not installs and not local_stale and fail_on not in (None, "none"):
         return 2  # nothing was checked, so a threshold can't be evaluated
-    return exit_code_for([install_severity(i) for i in installs], fail_on, default)
+    sevs = [install_severity(i) for i in installs] + (["high"] if local_stale else [])
+    return exit_code_for(sevs, fail_on, default)
 
 
 def add_fail_on(parser: argparse.ArgumentParser) -> None:
@@ -816,6 +938,7 @@ def add_fail_on(parser: argparse.ArgumentParser) -> None:
 # --- check command -----------------------------------------------------------
 
 def cmd_check(args: argparse.Namespace) -> int:
+    live = False
     if getattr(args, "inventory", None):
         installs = read_inventory(args.inventory)
     elif args.version:
@@ -827,9 +950,16 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         installs = [i for b in find_php_binaries(args.php_binary)
                     if (i := inspect_binary(b)) is not None]
+        live = True
+
+    # Restart awareness only makes sense for the machine we are running on.
+    stale: list = []
+    stale_note: Optional[str] = None
+    if live and not args.no_restart_check:
+        stale, stale_note = find_stale_php_processes()
 
     if getattr(args, "sarif", False):
-        print(json.dumps(check_to_sarif(installs), indent=2))
+        print(json.dumps(check_to_sarif(installs, stale), indent=2))
     elif args.json:
         payload = {
             "cves": CVES,
@@ -843,16 +973,20 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "fixed_version": i.verdict.fixed_version,
                     "upload_progress_enabled": i.upload_progress_enabled,
                     "config": i.config,
+                    "stale_processes": [asdict(s) for s in i.stale],
                     "detail": i.verdict.detail,
                 }
                 for i in installs
             ],
+            "stale_processes": [asdict(s) for s in stale],
+            "restart_check_note": stale_note,
         }
         print(json.dumps(payload, indent=2))
     else:
-        print_human(installs, use_color=sys.stdout.isatty() and not args.no_color)
+        print_human(installs, use_color=sys.stdout.isatty() and not args.no_color,
+                    stale=stale, stale_note=stale_note)
 
-    return check_exit_code(installs, args.fail_on)
+    return check_exit_code(installs, args.fail_on, local_stale=bool(stale))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -876,6 +1010,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")
     c.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    c.add_argument("--no-restart-check", action="store_true",
+                   help="skip the check for running PHP processes that still "
+                        "execute code replaced on disk (Linux /proc)")
     add_fail_on(c)
     c.set_defaults(func=cmd_check)
 
