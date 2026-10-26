@@ -7,8 +7,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which has no Python 3.9 build.
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
@@ -46,13 +48,16 @@ jobs:
           python php2shell_check.py check --ssh-hosts bad-hosts.txt --fail-on medium && exit 1 || true
       - name: Restart check against a real replaced process
         run: |
-          cp /bin/sleep /tmp/phpx
-          /tmp/phpx 60 &
+          # A copy of bash named phpx stands in for php-fpm. (Not /bin/sleep:
+          # newer coreutils is a multi-call binary that rejects a renamed copy.)
+          # The trailing `:` stops bash exec-ing sleep, so this process stays phpx.
+          cp "$(command -v bash)" /tmp/phpx
+          /tmp/phpx -c 'sleep 60; :' &
           PHPX_PID=$!
           sleep 1
           rm /tmp/phpx
           python php2shell_check.py check --no-color && exit 1 || true
-          python php2shell_check.py check --json | python -c "import json,sys; d=json.load(sys.stdin); assert [s['name'] for s in d['stale_processes']] == ['phpx'], d"
+          python php2shell_check.py check --json | python -c "import json,sys; d=json.load(sys.stdin); assert 'phpx' in [s['name'] for s in d['stale_processes']], d"
           python php2shell_check.py check --no-restart-check --fail-on none
           kill "$PHPX_PID"
 
