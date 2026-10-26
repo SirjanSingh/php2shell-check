@@ -170,13 +170,15 @@ def _run(cmd: list[str]) -> Optional[str]:
     return (out.stdout or "") + (out.stderr or "")
 
 
+PHP_CANDIDATES = ("php", "php-fpm", "php8.5", "php8.4", "php8.3", "php8.2",
+                  "php8.1", "php8.0", "php7.4")
+
+
 def find_php_binaries(explicit: Optional[str] = None) -> list[str]:
     if explicit:
         return [explicit]
-    candidates = ["php", "php-fpm", "php8.5", "php8.4", "php8.3", "php8.2",
-                  "php8.1", "php8.0", "php7.4"]
     found: list[str] = []
-    for name in candidates:
+    for name in PHP_CANDIDATES:
         path = shutil.which(name)
         if path and path not in found:
             found.append(path)
@@ -378,7 +380,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         else:
             tag = _c("UNKNOWN", "yellow", use_color)
         print(f"  {ins.binary}")
-        print(f"    {ins.raw_version}")
+        if ins.raw_version:
+            print(f"    {ins.raw_version}")
         print(f"    {tag}: {v.detail}")
         for note in posture_notes(ins):
             print(f"    note: {note}")
@@ -1110,6 +1113,170 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
     return exit_code_for(sevs, args.fail_on, 1 if affected else 0)
 
 
+# --- SSH fleet mode ----------------------------------------------------------
+#
+# For hosts YOU administer and hold keys for. The same fixed, read-only probe is
+# piped to `ssh HOST sh -s` on stdin (so nothing needs quoting for the remote
+# shell, and the host string never reaches a local shell). It runs `php -v`,
+# reads a few ini values and looks for processes on replaced code; it writes
+# nothing, opens no ports and sends no exploit traffic.
+
+_REMOTE_PROBE_TEMPLATE = r"""PROC=@PROC@
+seen=" "
+for name in @NAMES@; do
+  p=$(command -v "$name" 2>/dev/null) || continue
+  case "$seen" in *" $p "*) continue ;; esac
+  seen="$seen$p "
+  echo "BIN $p"
+  "$p" -v 2>&1 | head -n 1 | sed 's/^/VER /'
+  "$p" -i 2>/dev/null | grep -E '^(session\.upload_progress\.(enabled|cleanup)|post_max_size|memory_limit|fatal_error_backtraces) =>' | sed 's/^/INI /'
+done
+for d in "$PROC"/[0-9]*; do
+  pid=${d##*/}
+  comm=$(cat "$d/comm" 2>/dev/null) || continue
+  case "$comm" in
+    php*) check_exe=1 ;;
+    apache2|httpd) check_exe=0 ;;
+    *) continue ;;
+  esac
+  if [ "$check_exe" = 1 ]; then
+    exe=$(readlink "$d/exe" 2>/dev/null)
+    case "$exe" in
+      *" (deleted)")
+        echo "STALE $pid $comm binary replaced on disk ($(printf %s "$exe" | sed 's/ (deleted)$//'))"
+        continue ;;
+    esac
+  fi
+  lib=$(grep ' (deleted)$' "$d/maps" 2>/dev/null | sed 's/ (deleted)$//' | awk '{print $NF}' | sed 's|.*/||' | grep -E '^(php|libphp)' | head -n 1)
+  if [ -n "$lib" ]; then echo "STALE $pid $comm library replaced on disk ($lib)"; fi
+done
+exit 0
+"""
+
+
+def build_remote_probe(proc_root: str = "/proc") -> str:
+    return (_REMOTE_PROBE_TEMPLATE.replace("@PROC@", proc_root)
+            .replace("@NAMES@", " ".join(PHP_CANDIDATES)))
+
+
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:%-]*$")
+
+
+def read_ssh_hosts(path: str) -> list:
+    """Parse a hosts file: one `host` or `user@host` per line, `#` comments.
+    Returns (line_no, entry, error) tuples; error is None for a usable entry.
+    Anything that could be read as an ssh option (leading `-`) or contains
+    whitespace is rejected rather than passed on."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        return [(0, path, f"cannot read hosts file: {exc}")]
+    entries = []
+    for n, raw in enumerate(lines, 1):
+        entry = raw.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        if _HOST_RE.match(entry):
+            entries.append((n, entry, None))
+        else:
+            entries.append((n, entry, "not a plain host or user@host entry"))
+    return entries
+
+
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _clean(text: str) -> str:
+    """Remote output is untrusted: drop control characters (e.g. ANSI escapes)
+    before it is printed to the operator's terminal."""
+    return _CONTROL_RE.sub("?", text)
+
+
+def parse_remote_probe(host: str, text: str) -> list:
+    """Turn the probe's `BIN`/`VER`/`INI`/`STALE` lines into PhpInstall records
+    (one per binary). Restart findings belong to the host: they are attached to
+    its first record, or to a placeholder when no PHP binary was found."""
+    text = _clean(text.replace("\r", ""))
+    installs: list = []
+    stale_groups: dict = {}
+    current = None
+    ini_lines: list = []
+
+    def close() -> None:
+        if current is not None:
+            current.config = parse_ini_posture("\n".join(ini_lines))
+            current.upload_progress_enabled = _ini_bool(
+                current.config.get("session.upload_progress.enabled"))
+
+    for line in text.splitlines():
+        tag, _, rest = line.partition(" ")
+        if tag == "BIN":
+            close()
+            ini_lines = []
+            current = PhpInstall(f"{host}: {rest}", "", assess(None))
+            installs.append(current)
+        elif tag == "VER" and current is not None:
+            current.raw_version = rest.strip()
+            current.verdict = assess(parse_version(rest))
+        elif tag == "INI" and current is not None:
+            ini_lines.append(rest)
+        elif tag == "STALE":
+            parts = rest.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit():
+                stale_groups.setdefault((parts[1], parts[2]), []).append(int(parts[0]))
+    close()
+    stale = [StaleProcess(name, sorted(pids), reason)
+             for (name, reason), pids in sorted(stale_groups.items())]
+    if not installs:
+        installs.append(PhpInstall(
+            host, "", Verdict(None, STATUS_UNKNOWN, "No PHP binary found on this host.")))
+    installs[0].stale = stale
+    return installs
+
+
+def probe_host(host: str, timeout: int = 90) -> list:
+    """Run the probe on one host over ssh. Never raises: a host that can't be
+    reached comes back as an UNKNOWN record carrying the reason."""
+    def unknown(reason: str) -> list:
+        return [PhpInstall(host, "", Verdict(None, STATUS_UNKNOWN, reason))]
+
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+           "--", host, "sh", "-s"]
+    try:
+        proc = subprocess.run(cmd, input=build_remote_probe(), capture_output=True,
+                              text=True, timeout=timeout)
+    except FileNotFoundError:
+        return unknown("the `ssh` client was not found on PATH")
+    except subprocess.TimeoutExpired:
+        return unknown(f"ssh timed out after {timeout}s")
+    except OSError as exc:
+        return unknown(f"could not run ssh: {exc}")
+    if proc.returncode != 0 and not proc.stdout.strip():
+        err = (proc.stderr or "").strip().splitlines()
+        return unknown(f"ssh failed (exit {proc.returncode}): "
+                       f"{err[-1] if err else 'no error output'}")
+    return parse_remote_probe(host, proc.stdout)
+
+
+def scan_ssh_hosts(path: str, jobs: int = 8) -> list:
+    from concurrent.futures import ThreadPoolExecutor
+    entries = read_ssh_hosts(path)
+    good = list(dict.fromkeys(e for _, e, err in entries if err is None))
+    with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(good) or 1))) as pool:
+        probed = dict(zip(good, pool.map(probe_host, good)))
+    installs: list = []
+    emitted: set = set()
+    for n, entry, err in entries:
+        if err is not None:
+            installs.append(PhpInstall(
+                f"{path}:{n}", "", Verdict(None, STATUS_UNKNOWN, f"{err}: {entry!r}")))
+        elif entry not in emitted:
+            emitted.add(entry)
+            installs.extend(probed[entry])
+    return installs
+
+
 # --- exit codes / --fail-on --------------------------------------------------
 
 FAIL_ON_CHOICES = ("high", "medium", "low", "none")
@@ -1165,6 +1332,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     live = False
     if getattr(args, "inventory", None):
         installs = read_inventory(args.inventory)
+    elif getattr(args, "ssh_hosts", None):
+        installs = scan_ssh_hosts(args.ssh_hosts, args.ssh_jobs)
     elif args.version:
         v = parse_version(args.version)
         verdict = assess(v)
@@ -1230,6 +1399,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--inventory", metavar="FILE",
                    help="offline fleet check: a file of `label version` lines "
                         "(no network, no SSH)")
+    c.add_argument("--ssh-hosts", metavar="FILE",
+                   help="fleet check over ssh: a file of `host` / `user@host` lines. "
+                        "Runs a fixed read-only probe on hosts you hold keys for "
+                        "(key auth only; known_hosts is honoured)")
+    c.add_argument("--ssh-jobs", type=int, default=8, metavar="N",
+                   help="hosts to probe in parallel with --ssh-hosts (default 8)")
     c.add_argument("--json", action="store_true", help="machine-readable output")
     c.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")

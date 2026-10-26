@@ -3,8 +3,11 @@
 
 import contextlib
 import io
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 import uuid
@@ -37,6 +40,11 @@ from php2shell_check import (  # noqa: E402
     render_modsecurity,
     render_suricata,
     render_sigma,
+    read_ssh_hosts,
+    parse_remote_probe,
+    probe_host,
+    scan_ssh_hosts,
+    build_remote_probe,
     main,
     LINE_INDICATORS,
     RULE_FILENAMES,
@@ -476,6 +484,155 @@ class RulesTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             # a file where the output directory should be
             self.assertEqual(main(["rules", "--output", fh.name]), 2)
+
+
+PROBE_SAMPLE = """\
+BIN /usr/bin/php
+VER PHP 8.4.26 (cli) (built: Oct  1 2026)
+INI memory_limit => 128M => 128M
+INI session.upload_progress.enabled => On => On
+BIN /usr/sbin/php-fpm8.4
+VER PHP 8.4.27 (fpm-fcgi) (built: Oct 22 2026)
+STALE 812 php-fpm8.4 library replaced on disk (libphp8.4.so)
+STALE 811 php-fpm8.4 library replaced on disk (libphp8.4.so)
+"""
+
+
+class SshFleetTests(unittest.TestCase):
+    def _hosts_file(self, text):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        fh.write(text)
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def test_hosts_file_parsing_and_validation(self):
+        path = self._hosts_file(
+            "web01\nadmin@web02.example.com  # primary\n# comment\n\n"
+            "-oProxyCommand=evil\nweb 03\n10.0.0.5\nfe80::1%eth0\n")
+        entries = read_ssh_hosts(path)
+        ok = [e for _, e, err in entries if err is None]
+        bad = [e for _, e, err in entries if err is not None]
+        self.assertEqual(ok, ["web01", "admin@web02.example.com", "10.0.0.5", "fe80::1%eth0"])
+        self.assertEqual(bad, ["-oProxyCommand=evil", "web 03"])
+
+    def test_unreadable_hosts_file(self):
+        entries = read_ssh_hosts(os.path.join(tempfile.gettempdir(), "nope-php2shell.txt"))
+        self.assertIsNotNone(entries[0][2])
+
+    def test_parse_remote_probe(self):
+        installs = parse_remote_probe("web01", PROBE_SAMPLE)
+        self.assertEqual([i.binary for i in installs],
+                         ["web01: /usr/bin/php", "web01: /usr/sbin/php-fpm8.4"])
+        self.assertEqual(installs[0].verdict.status, STATUS_VULNERABLE)
+        self.assertEqual(installs[1].verdict.status, STATUS_PATCHED)
+        self.assertEqual(installs[0].config["memory_limit"], "128M")
+        self.assertTrue(installs[0].upload_progress_enabled)
+        # restart findings belong to the host and sit on its first record, grouped
+        self.assertEqual(len(installs[0].stale), 1)
+        self.assertEqual(installs[0].stale[0].pids, [811, 812])
+        self.assertEqual(installs[1].stale, [])
+
+    def test_parse_remote_probe_without_php(self):
+        installs = parse_remote_probe("db01", "")
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0].verdict.status, STATUS_UNKNOWN)
+        self.assertEqual(installs[0].binary, "db01")
+
+    def test_parse_remote_probe_stale_without_binary(self):
+        installs = parse_remote_probe(
+            "db01", "STALE 5 apache2 library replaced on disk (libphp8.4.so)\n")
+        self.assertEqual(installs[0].verdict.status, STATUS_UNKNOWN)
+        self.assertEqual(installs[0].stale[0].name, "apache2")
+        self.assertEqual(check_exit_code(installs, None), 1)
+
+    def test_remote_output_is_sanitized(self):
+        installs = parse_remote_probe(
+            "h", "BIN /usr/bin/php\x1b[2J\nVER PHP 8.4.27\x1b[31m (cli)\n")
+        self.assertNotIn("\x1b", installs[0].binary)
+        self.assertNotIn("\x1b", installs[0].raw_version)
+
+    def test_probe_host_runs_ssh_safely(self):
+        done = mock.Mock(returncode=0, stdout=PROBE_SAMPLE, stderr="")
+        with mock.patch("php2shell_check.subprocess.run", return_value=done) as run:
+            installs = probe_host("admin@web01")
+        cmd = run.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertIn("BatchMode=yes", cmd)
+        self.assertEqual(cmd[cmd.index("--") + 1], "admin@web01")  # host after `--`
+        self.assertEqual(cmd[-2:], ["sh", "-s"])
+        self.assertIn("command -v", run.call_args.kwargs["input"])
+        self.assertEqual(len(installs), 2)
+
+    def test_probe_host_failures_become_unknown(self):
+        failed = mock.Mock(returncode=255, stdout="", stderr="x\nPermission denied (publickey).\n")
+        for effect, text in [
+            (FileNotFoundError(), "ssh"),
+            (subprocess.TimeoutExpired("ssh", 1), "timed out"),
+        ]:
+            with self.subTest(text=text), \
+                    mock.patch("php2shell_check.subprocess.run", side_effect=effect):
+                inst = probe_host("web01")[0]
+                self.assertEqual(inst.verdict.status, STATUS_UNKNOWN)
+                self.assertIn(text, inst.verdict.detail)
+        with mock.patch("php2shell_check.subprocess.run", return_value=failed):
+            inst = probe_host("web01")[0]
+        self.assertIn("Permission denied (publickey)", inst.verdict.detail)
+
+    def test_scan_ssh_hosts_and_cli(self):
+        path = self._hosts_file("web01\nweb01\n--bad\nweb02\n")
+
+        def fake_probe(host, timeout=90):
+            return parse_remote_probe(host, PROBE_SAMPLE if host == "web01" else "")
+
+        with mock.patch("php2shell_check.probe_host", side_effect=fake_probe) as probe:
+            installs = scan_ssh_hosts(path, jobs=4)
+            self.assertEqual(probe.call_count, 2)  # duplicate host probed once
+        self.assertEqual([i.binary for i in installs],
+                         ["web01: /usr/bin/php", "web01: /usr/sbin/php-fpm8.4",
+                          path + ":3", "web02"])
+        self.assertIn("not a plain host", installs[2].verdict.detail)
+        with mock.patch("php2shell_check.probe_host", side_effect=fake_probe), \
+                contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = main(["check", "--ssh-hosts", path, "--no-color", "--json"])
+        self.assertEqual(code, 1)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["stale_processes"], [])  # local check is skipped
+        self.assertEqual(payload["installs"][0]["stale_processes"][0]["pids"], [811, 812])
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs a POSIX sh")
+    def test_probe_script_against_fake_proc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for pid, comm, maps in [
+                (100, "php-fpm8.4", _maps_line("/usr/lib/libphp8.4.so")),
+                (101, "apache2", _maps_line("/usr/lib/libssl.so.3")),
+                (102, "bash", _maps_line("/usr/lib/libphp8.4.so")),
+                (103, "php-fpm8.4", _maps_line("/usr/lib/libphp8.4.so", deleted=False)),
+            ]:
+                d = os.path.join(tmp, "proc", str(pid))
+                os.makedirs(d)
+                with open(os.path.join(d, "comm"), "w") as fh:
+                    fh.write(comm + "\n")
+                with open(os.path.join(d, "maps"), "w") as fh:
+                    fh.write(maps + "\n")
+            os.makedirs(os.path.join(tmp, "bin"))
+            php = os.path.join(tmp, "bin", "php")
+            with open(php, "w") as fh:
+                fh.write('#!/bin/sh\ncase "$1" in\n'
+                         '  -v) echo "PHP 8.4.26 (cli)" ;;\n'
+                         '  -i) echo "memory_limit => 128M => 128M" ;;\nesac\n')
+            os.chmod(php, 0o755)
+            env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + "/usr/bin:/bin")
+            out = subprocess.run(
+                ["sh", "-s"], input=build_remote_probe(os.path.join(tmp, "proc")),
+                capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        installs = parse_remote_probe("h", out.stdout)
+        self.assertEqual(installs[0].verdict.status, STATUS_VULNERABLE)
+        self.assertEqual(installs[0].config["memory_limit"], "128M")
+        self.assertEqual([(s.name, s.pids) for s in installs[0].stale],
+                         [("php-fpm8.4", [100])])
 
 
 class FailOnTests(unittest.TestCase):
