@@ -39,6 +39,12 @@ jobs:
           python php2shell_check.py scan-docker Dockerfile.float --fail-on high
           python php2shell_check.py scan-docker Dockerfile.float --fail-on medium && exit 1 || true
           python php2shell_check.py rules > /dev/null
+          mkdir sc && printf "<?php
+ini_set('session.serialize_handler', 'php');
+" > sc/app.php
+          python php2shell_check.py scan-code sc && exit 1 || true
+          python php2shell_check.py scan-code sc --fail-on none
+          python php2shell_check.py scan-code tests --fail-on medium
           python php2shell_check.py rules --output rules-out --block
           test -s rules-out/php2shell-modsecurity.conf
           test -s rules-out/php2shell-sigma.yml

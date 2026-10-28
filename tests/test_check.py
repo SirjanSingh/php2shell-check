@@ -45,6 +45,10 @@ from php2shell_check import (  # noqa: E402
     probe_host,
     scan_ssh_hosts,
     build_remote_probe,
+    session_handler_notes,
+    classify_code_line,
+    scan_code_file,
+    iter_code_files,
     main,
     LINE_INDICATORS,
     RULE_FILENAMES,
@@ -672,6 +676,97 @@ class FailOnTests(unittest.TestCase):
                                    "--fail-on", "none"]), 0)
             self.assertEqual(main(["check", "--version", "8.4.27", "--no-color",
                                    "--fail-on", "low"]), 0)
+
+
+class SessionHandlerTests(unittest.TestCase):
+    """CVE-2026-115560: not fixed by the 2026-10-21 releases, so these apply to
+    patched installs too."""
+
+    def _install(self, version, upload, handler="php"):
+        cfg = {"session.serialize_handler": handler,
+               "session.upload_progress.enabled": "On" if upload else "Off"}
+        return PhpInstall("php", version, assess(parse_version(version)), upload, cfg)
+
+    def test_posture_parses_serialize_handler(self):
+        cfg = parse_ini_posture("session.serialize_handler => php_serialize => php\n")
+        self.assertEqual(cfg["session.serialize_handler"], "php_serialize")
+
+    def test_note_applies_to_patched_install(self):
+        notes = " ".join(session_handler_notes(self._install("8.4.27", True)))
+        self.assertIn("CVE-2026-115560", notes)
+        self.assertIn("not fixed by the 2026-10-21", notes)
+        self.assertIn("scan-code", notes)
+
+    def test_note_names_nondefault_handler(self):
+        notes = " ".join(session_handler_notes(self._install("8.4.27", True, "php_serialize")))
+        self.assertIn("session.serialize_handler=php_serialize", notes)
+        plain = " ".join(session_handler_notes(self._install("8.4.27", True, "php")))
+        self.assertNotIn("serialize_handler=php", plain)
+
+    def test_no_note_when_upload_progress_off_or_unknown(self):
+        self.assertEqual(session_handler_notes(self._install("8.4.27", False)), [])
+        self.assertEqual(session_handler_notes(PhpInstall("x", "", assess(None))), [])
+
+    def test_note_does_not_change_exit_code(self):
+        good = self._install("8.4.27", True, "php_serialize")
+        self.assertEqual(check_exit_code([good], None), 0)
+
+    def test_classify_lines(self):
+        c = classify_code_line
+        self.assertEqual(c("ini_set('session.serialize_handler', 'php');"), "ini_set_php")
+        self.assertEqual(c('  ini_set( "session.serialize_handler" , "php" ) ;'), "ini_set_php")
+        self.assertEqual(c("ini_set('session.serialize_handler', $h);"), "ini_set_other")
+        self.assertEqual(c("ini_set('session.serialize_handler', 'php_serialize');"),
+                         "ini_set_other")
+        self.assertEqual(c("session.serialize_handler = php_serialize"), "config_nondefault")
+        self.assertEqual(c("php_value session.serialize_handler php_binary"),
+                         "config_nondefault")
+        self.assertIsNone(c("session.serialize_handler = php"))
+        self.assertIsNone(c("ini_set('memory_limit', '256M');"))
+        self.assertIsNone(c("// serialize_handler is documented here"))
+
+    def test_scan_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "vendor", "x"))
+            os.makedirs(os.path.join(d, ".git"))
+            with open(os.path.join(d, "vendor", "x", "s.php"), "w") as fh:
+                fh.write("<?php\nini_set('session.serialize_handler', 'php');\nsession_start();\n")
+            with open(os.path.join(d, "app.php"), "w") as fh:
+                fh.write("<?php echo 1;\n")
+            with open(os.path.join(d, ".user.ini"), "w") as fh:
+                fh.write("session.serialize_handler = php_serialize\n")
+            with open(os.path.join(d, ".git", "c.php"), "w") as fh:
+                fh.write("ini_set('session.serialize_handler', 'php');\n")
+            with open(os.path.join(d, "notes.txt"), "w") as fh:
+                fh.write("ini_set('session.serialize_handler', 'php');\n")
+            files, errors = iter_code_files([d])
+            self.assertEqual(errors, [])
+            self.assertEqual(len(files), 3)  # .git and .txt skipped
+            kinds = sorted(f.kind for p in files for f in scan_code_file(p))
+            self.assertEqual(kinds, ["config_nondefault", "ini_set_php"])
+
+    def test_cli_scan_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            clean = os.path.join(d, "a.php")
+            with open(clean, "w") as fh:
+                fh.write("<?php echo 1;\n")
+            bad = os.path.join(d, "b.php")
+            with open(bad, "w") as fh:
+                fh.write("<?php ini_set('session.serialize_handler','php');\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main(["scan-code", clean]), 0)
+                self.assertEqual(main(["scan-code", d]), 1)
+                self.assertEqual(main(["scan-code", d, "--fail-on", "none"]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(["scan-code", d, "--json"])
+            data = json.loads(out.getvalue())
+            self.assertEqual(data["cve"], "CVE-2026-115560")
+            self.assertEqual(data["findings"][0]["kind"], "ini_set_php")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["scan-code"]), 2)
+            self.assertEqual(main(["scan-code", "/no/such/path"]), 2)
 
 
 if __name__ == "__main__":

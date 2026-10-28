@@ -18,6 +18,12 @@ PHP install is affected and tells you how to fix it. It does not send any
 exploit traffic and it cannot be pointed at a remote host — it is a
 defensive checker/preventer, not an attack tool.
 
+A separate, later issue, CVE-2026-115560 (disclosed 2026-10-23), is NOT fixed by
+those releases and has no patch yet. It needs an unusual setup: a non-default
+session.serialize_handler switched to `php` at runtime with ini_set(), with
+session.upload_progress.enabled still on. `check` reports the config side of
+that and `scan-code` looks for the application-code side.
+
 Usage:
     php2shell-check check [--php-binary PATH] [--version X.Y.Z] [--json]
                           [--inventory FILE | --ssh-hosts FILE [--ssh-jobs N]]
@@ -25,6 +31,7 @@ Usage:
     php2shell-check harden [--apply] [--conf-dir DIR] [--php-binary PATH]
     php2shell-check scan-logs LOGFILE [...] [--fail-on LEVEL]
     php2shell-check scan-docker [PATH ...] [--running] [--fail-on LEVEL]
+    php2shell-check scan-code PATH [...] [--json] [--fail-on LEVEL]
     php2shell-check rules [--format modsecurity|sigma|suricata|all]
                           [--output DIR] [--block]
 
@@ -48,12 +55,20 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # --- Vulnerability data -----------------------------------------------------
 
 CVES = ["CVE-2026-109618", "CVE-2026-109619"]
 DISCLOSED = "2026-10-21"
+
+# A separate, later issue. The 2026-10-21 releases do NOT fix it, and PHP has
+# named no fixed version yet ("the next regular bugfix release"). It needs an
+# unusual combination: session.serialize_handler set to php_binary or
+# php_serialize in config, an app that switches it to `php` with ini_set()
+# before session_start(), and session.upload_progress.enabled still on.
+CVE_SESSION = "CVE-2026-115560"
+DISCLOSED_SESSION = "2026-10-23"
 
 # Minimum patched release for each still-supported branch. A version on one of
 # these branches is safe only at or above the given patch number.
@@ -197,6 +212,7 @@ def find_php_binaries(explicit: Optional[str] = None) -> list[str]:
 POSTURE_KEYS = (
     "session.upload_progress.enabled",
     "session.upload_progress.cleanup",
+    "session.serialize_handler",
     "post_max_size",
     "memory_limit",
     "fatal_error_backtraces",
@@ -366,6 +382,28 @@ def posture_notes(ins: PhpInstall) -> list[str]:
     return notes
 
 
+def session_handler_notes(ins: PhpInstall) -> list[str]:
+    """CVE-2026-115560 posture. Unlike posture_notes this applies to patched
+    installs too: the 2026-10-21 releases do not fix it. It never changes the
+    exit code, because a config note cannot show the app-side `ini_set()` that
+    the issue also needs (that is what `scan-code` looks for)."""
+    cfg = ins.config
+    if not cfg or ins.upload_progress_enabled is not True:
+        return []
+    handler = cfg.get("session.serialize_handler", "").strip().lower()
+    lead = (f"{CVE_SESSION} (disclosed {DISCLOSED_SESSION}, no fixed release yet; "
+            "not fixed by the 2026-10-21 updates): "
+            "session.upload_progress.enabled is On")
+    if handler in ("php_binary", "php_serialize"):
+        lead += f" and session.serialize_handler={handler}"
+    notes = [lead + ". Exploitable only if application code also switches the "
+             "handler to 'php' with ini_set() before session_start(): "
+             "run `php2shell-check scan-code /var/www` to look for that."]
+    notes.append("PHP's interim advice: session.upload_progress.enabled=0 in "
+                 "php.ini / the FPM pool (not ini_set or .user.ini), then restart workers.")
+    return notes
+
+
 def print_human(installs: list[PhpInstall], use_color: bool,
                 stale: Optional[list] = None, stale_note: Optional[str] = None) -> None:
     """`stale`/`stale_note` are the local restart-check results; remote hosts
@@ -392,6 +430,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         print(f"    {tag}: {v.detail}")
         for note in posture_notes(ins):
             print(f"    note: {note}")
+        for note in session_handler_notes(ins):
+            print(f"    note: {note}")
         print_stale(ins.stale, use_color, indent="    ")
         print()
 
@@ -417,8 +457,10 @@ PARTIAL_WORKAROUND_INI = (
     "; php2shell-check: PARTIAL mitigation for {cves}.\n"
     "; This blocks the confirmed session.upload_progress exploit path only.\n"
     "; It is NOT a full fix — you MUST still update PHP to a patched release.\n"
+    "; It is also PHP's interim advice for {session_cve}, which the October 21\n"
+    "; updates do not fix.\n"
     "session.upload_progress.enabled = Off\n"
-).format(cves=", ".join(CVES))
+).format(cves=", ".join(CVES), session_cve=CVE_SESSION)
 
 
 def detect_os() -> str:
@@ -666,6 +708,140 @@ def cmd_scan_logs(args: argparse.Namespace) -> int:
               "confirmed compromise. Patch PHP regardless.")
     return exit_code_for([f.severity for f in all_findings] + ["medium"] * len(all_alerts),
                          args.fail_on, 1 if (all_findings or all_alerts) else 0)
+
+
+# --- scan-code (CVE-2026-115560) ----------------------------------------------
+#
+# The session-handler issue needs application code that switches
+# session.serialize_handler to `php` at runtime with ini_set(). Nothing else on
+# the box can tell you that, so this greps PHP sources and config files for it.
+# Read-only, local, stdlib: it opens files and never runs or fetches anything.
+# It finds the code-side precondition only; whether the issue is reachable also
+# depends on session.upload_progress.enabled (see `check`).
+
+CODE_SUFFIXES = (".php", ".phtml", ".inc", ".php3", ".php4", ".php5", ".php7",
+                 ".phps", ".ini", ".conf")
+CODE_NAMES = (".htaccess", ".user.ini")
+CODE_MAX_BYTES = 5_000_000
+
+_INI_SET_RE = re.compile(
+    r"""ini_set\s*\(\s*(['"])session\.serialize_handler\1\s*,\s*(?P<value>[^)]*)\)""",
+    re.IGNORECASE)
+_CONFIG_HANDLER_RE = re.compile(
+    r"""(?:^|[\s;])(?:php_(?:admin_)?value\s+)?session\.serialize_handler\s*[= ]\s*
+        ["']?(?P<value>php_binary|php_serialize)\b""",
+    re.IGNORECASE | re.VERBOSE)
+
+
+@dataclass
+class CodeFinding:
+    file: str
+    line_no: int
+    kind: str
+    severity: str
+    excerpt: str
+
+
+CODE_KINDS = {
+    "ini_set_php": ("high",
+                    "ini_set() switches session.serialize_handler to 'php' - the "
+                    "code half of the CVE-2026-115560 precondition"),
+    "ini_set_other": ("medium",
+                      "ini_set() changes session.serialize_handler to a value this "
+                      "scan cannot read statically - review it"),
+    "config_nondefault": ("low",
+                          "session.serialize_handler is set to php_binary/php_serialize "
+                          "here - the config half of the precondition, harmless alone"),
+}
+
+
+def classify_code_line(line: str) -> Optional[str]:
+    m = _INI_SET_RE.search(line)
+    if m:
+        value = m.group("value").strip().strip("'\"").strip().lower()
+        return "ini_set_php" if value == "php" else "ini_set_other"
+    if _CONFIG_HANDLER_RE.search(line):
+        return "config_nondefault"
+    return None
+
+
+def iter_code_files(paths: list) -> tuple:
+    """Yield-free walk: returns (files, errors). Symlinks are not followed."""
+    files: list = []
+    errors: list = []
+    for root in paths:
+        if os.path.islink(root) or not os.path.exists(root):
+            errors.append(f"{root}: not found or a symlink")
+            continue
+        if os.path.isfile(root):
+            files.append(root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    continue
+                if name.lower().endswith(CODE_SUFFIXES) or name.lower() in CODE_NAMES:
+                    files.append(full)
+    return files, errors
+
+
+def scan_code_file(path: str) -> list:
+    try:
+        if os.path.getsize(path) > CODE_MAX_BYTES:
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    out = []
+    for n, line in enumerate(lines, 1):
+        kind = classify_code_line(line)
+        if kind:
+            out.append(CodeFinding(path, n, kind, CODE_KINDS[kind][0],
+                                   _clean(line.strip()[:300])))
+    return out
+
+
+def cmd_scan_code(args: argparse.Namespace) -> int:
+    if not args.paths:
+        print("Usage: php2shell-check scan-code PATH [PATH ...] [--json]",
+              file=sys.stderr)
+        return 2
+    files, errors = iter_code_files(args.paths)
+    findings: list = []
+    for f in files:
+        findings.extend(scan_code_file(f))
+    for err in errors:
+        print(f"warning: {err}", file=sys.stderr)
+    if errors and not files:
+        return 2
+
+    if args.json:
+        print(json.dumps({
+            "cve": CVE_SESSION,
+            "files_scanned": len(files),
+            "findings": [asdict(f) for f in findings],
+        }, indent=2))
+    else:
+        print(f"Session-handler code scan  ({CVE_SESSION}, disclosed {DISCLOSED_SESSION})\n")
+        print(f"  scanned {len(files)} file(s)\n")
+        order = {"high": 0, "medium": 1, "low": 2}
+        for f in sorted(findings, key=lambda x: order.get(x.severity, 9)):
+            print(f"  [{f.severity.upper()}] {f.kind}  {f.file}:{f.line_no}")
+            print(f"      {f.excerpt}")
+            print(f"      {CODE_KINDS[f.kind][1]}")
+        if not findings:
+            print("  No runtime serialize_handler switch found.")
+        print("\n  This only finds the application-code precondition. The issue is "
+              "reachable only while")
+        print("  session.upload_progress.enabled is On, and PHP has not released a fix "
+              "yet; its interim")
+        print("  advice is session.upload_progress.enabled=0 in php.ini / the FPM pool, "
+              "then restart workers.")
+    return exit_code_for([f.severity for f in findings], args.fail_on,
+                         1 if any(f.severity in ("high", "medium") for f in findings) else 0)
 
 
 # --- SARIF output ------------------------------------------------------------
@@ -1136,7 +1312,7 @@ for name in @NAMES@; do
   seen="$seen$p "
   echo "BIN $p"
   "$p" -v 2>&1 | head -n 1 | sed 's/^/VER /'
-  "$p" -i 2>/dev/null | grep -E '^(session\.upload_progress\.(enabled|cleanup)|post_max_size|memory_limit|fatal_error_backtraces) =>' | sed 's/^/INI /'
+  "$p" -i 2>/dev/null | grep -E '^(session\.upload_progress\.(enabled|cleanup)|session\.serialize_handler|post_max_size|memory_limit|fatal_error_backtraces) =>' | sed 's/^/INI /'
 done
 for d in "$PROC"/[0-9]*; do
   pid=${d##*/}
@@ -1373,6 +1549,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "fixed_version": i.verdict.fixed_version,
                     "upload_progress_enabled": i.upload_progress_enabled,
                     "config": i.config,
+                    "session_handler_notes": session_handler_notes(i),
                     "stale_processes": [asdict(s) for s in i.stale],
                     "detail": i.verdict.detail,
                 }
@@ -1455,6 +1632,14 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--json", action="store_true", help="machine-readable output")
     add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
+
+    k = sub.add_parser("scan-code",
+                       help="look for runtime session.serialize_handler switches "
+                            "(CVE-2026-115560)")
+    k.add_argument("paths", nargs="*", help="directories or files to scan")
+    k.add_argument("--json", action="store_true", help="machine-readable output")
+    add_fail_on(k)
+    k.set_defaults(func=cmd_scan_code)
 
     r = sub.add_parser("rules",
                        help="emit ready-to-paste ModSecurity / Sigma / Suricata rules")
