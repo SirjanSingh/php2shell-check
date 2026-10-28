@@ -7,3 +7,6 @@ venv/
 build/
 dist/
 .DS_Store
+
+# Local research notes (not part of the package)
+RESEARCH-and-features.md

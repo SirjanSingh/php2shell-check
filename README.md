@@ -6,12 +6,20 @@
 ![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 Fast, zero-dependency checker and remediation helper for the **PHP2Shell** remote
-code execution flaws — **CVE-2026-109618** and **CVE-2026-109619**.
+code execution flaws, **CVE-2026-109618** and **CVE-2026-109619**.
 
-> **What this is:** a *defensive* tool. It inspects systems you operate — the
+What it does that the PoC-style scanners don't: it tells you whether the upgrade
+is actually *running* (patched on disk but workers still on old code), scans your
+logs back to **2026-10-17**, when Amazon logged the first known attempt (four
+days before the patches), generates
+ready-to-paste ModSecurity, Sigma and Suricata rules, checks a fleet over SSH,
+and covers the follow-up session-handler issue **CVE-2026-115560**, which the
+October 21 patches do not fix.
+
+> **What this is:** a *defensive* tool. It inspects systems you operate, the
 > local PHP install, version strings, Dockerfiles/compose files, your own
 > running containers, your own logs, and (optionally) hosts you already have SSH
-> keys for — tells you whether you're affected, and gives you the exact steps to
+> keys for, tells you whether you're affected, and gives you the exact steps to
 > fix it. It sends **no** exploit traffic and has no URL/probe mode. It is not an
 > exploit and does not contain one.
 
@@ -32,10 +40,10 @@ core RCE vulnerabilities, collectively nicknamed *PHP2Shell*:
 | | |
 |---|---|
 | CVEs | CVE-2026-109618, CVE-2026-109619 |
-| Severity | Critical — CVSS v4.0 **9.2** |
+| Severity | Critical, CVSS v4.0 **9.2** |
 | Affected | PHP **5.4 through 8.5** |
 | Fixed in | **8.5.12, 8.4.27, 8.3.36, 8.2.35** |
-| Workaround | Disabling `session.upload_progress` blocks the confirmed path but is **incomplete** — patching is the only full fix |
+| Workaround | Disabling `session.upload_progress` blocks the confirmed path but is **incomplete**; patching is the only full fix |
 
 PHP 5.x and 7.x are end-of-life and receive **no** official fix; affected servers
 on those branches must move to a supported, patched branch.
@@ -53,14 +61,10 @@ Or install it as a command with `pipx` (or `pip`):
 
 ```bash
 pipx install php2shell-check          # from PyPI
-# or straight from source, no release needed:
+# or straight from source:
 pipx install git+https://github.com/SirjanSingh/shiny-php
 php2shell-check check
 ```
-
-> The restart check, `--fail-on`, `--ssh-hosts`, `rules` and the config-posture
-> report are on `main` but newer than the 0.1.0 PyPI release. Use the `curl`
-> one-liner or the `git+` install above to get them until the next release.
 
 > Maintainers: see [RELEASING.md](RELEASING.md) for the one-time PyPI
 > Trusted-Publishing setup. Tagging `vX.Y.Z` then publishes automatically.
@@ -107,7 +111,7 @@ Run it as root to see every worker; processes it can't inspect are reported, not
 skipped silently. Skip the check with `--no-restart-check`. It is not available
 on non-Linux systems, and it only sees processes in the PID namespace it runs in.
 
-### Check a version string (no live PHP needed — great for CI / inventory)
+### Check a version string (no live PHP needed, great for CI / inventory)
 
 ```bash
 ./php2shell_check.py check --version 8.3.40
@@ -128,7 +132,7 @@ determine. Drop it straight into CI:
 
 #### Choosing what fails the build: `--fail-on`
 
-`check`, `scan-logs` and `scan-docker` accept `--fail-on high|medium|low|none`.
+`check`, `scan-logs`, `scan-docker` and `scan-code` accept `--fail-on high|medium|low|none`.
 Without it the exit codes above are unchanged. With it, the command exits `1`
 only for findings at or above that level, and `0` otherwise (`none` always
 exits `0`, e.g. to report without gating).
@@ -152,7 +156,7 @@ exits `0`, e.g. to report without gating).
 ```
 
 `harden` detects your OS and prints the right package-manager commands. With
-`--apply` it writes a drop-in ini that disables `session.upload_progress` — a
+`--apply` it writes a drop-in ini that disables `session.upload_progress`, a
 **partial** mitigation; it will still tell you to update PHP.
 
 ### Scan logs for attack attempts
@@ -175,10 +179,10 @@ published by security vendors after disclosure:
 | Repeated large POSTs from one source IP | access log (heuristic) | Bitdefender, Beazley |
 
 > **Important:** plain access logs almost never record request bodies, so a clean
-> access-log scan is **not** an all-clear — the body/field indicators need a
+> access-log scan is **not** an all-clear; the body/field indicators need a
 > WAF/ModSecurity log. And patch PHP regardless; detection is not prevention.
 > These are behavioral signals based on expected exploit behavior, not confirmed
-> atomic IoCs — validate against your own logs.
+> atomic IoCs. Validate against your own logs.
 
 ### Scan Docker images
 
@@ -198,7 +202,7 @@ and an end-of-life branch tag (`php:8.1`) is flagged affected outright.
 ./php2shell_check.py check --inventory hosts.txt
 ```
 
-`hosts.txt` is one `label version` per line — straight from your inventory /
+`hosts.txt` is one `label version` per line, straight from your inventory /
 Ansible facts, no network or SSH involved (for live hosts, see the next section):
 
 ```
@@ -229,6 +233,35 @@ administration for machines you already hold SSH keys for.
   the reason; with `--fail-on medium` that fails the run, by default it does not.
 - Works with `--json`, `--sarif` and `--fail-on`. The remote needs a POSIX `sh`
   (and `/proc` for the restart check).
+
+### The follow-up issue: CVE-2026-115560
+
+On 2026-10-23 PHP disclosed a separate code-execution issue in session handling.
+**The October 21 updates do not fix it** and, at the time of writing, there is no
+fixed release (PHP says "the next regular bugfix release"). PHP calls the
+precondition unlikely: all three of these must hold.
+
+1. `session.serialize_handler` is set to `php_binary` or `php_serialize` in config.
+2. Application code switches it to `php` with `ini_set()` before `session_start()`.
+3. `session.upload_progress.enabled` is still On (the default).
+
+PHP's interim advice is `session.upload_progress.enabled=0` in `php.ini` or the
+FPM pool, then restart the workers. If you already did that for PHP2Shell you are
+covered. This tool checks both halves, read-only and locally:
+
+```bash
+./php2shell_check.py check                  # notes it when upload_progress is On, patched or not
+./php2shell_check.py scan-code /var/www     # greps PHP sources, .htaccess, .user.ini and ini files
+```
+
+`check` reports the config side (it never changes the exit code, because it cannot
+see your application code). `scan-code` finds the code side: an `ini_set()` of
+`session.serialize_handler` to `'php'` is `high`, one it cannot resolve statically
+is `medium`, and a non-default handler in a config file is `low`. It does not
+skip `vendor/`, since the switch can sit in a dependency. A finding means the
+precondition exists, not that you are exploitable or exploited. Details and
+affected versions are not published yet; see the
+[PHP notice](https://www.php.net/archive/2026.php).
 
 ### Generate WAF / IDS rules
 
@@ -286,9 +319,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      # --fail-on, --ssh-hosts and `rules` are newer than the 0.1.0 PyPI release,
-      # so install from source until the next release is published.
-      - run: pip install git+https://github.com/SirjanSingh/shiny-php
+      - run: pip install "php2shell-check>=0.2.0"
 
       # Fail on affected, or unpinned, PHP base images in Dockerfiles/compose files.
       - run: php2shell-check scan-docker --fail-on medium
@@ -325,21 +356,22 @@ need Linux (`/proc`, a POSIX `sh`) are skipped elsewhere.
 
 ## Sources
 
-- [The Hacker News — PHP emergency patches for PHP2Shell RCE](https://thehackernews.com/2026/10/php-issues-emergency-patches-for-two.html)
-- [Qualys — find, mitigate, and patch PHP2Shell](https://blog.qualys.com/vulnerabilities-threat-research/2026/10/20/php-announces-critical-security-release-for-two-vulnerabilities)
-- [DigitalOcean — Critical PHP RCE, patch now](https://www.digitalocean.com/blog/critical-php-rce-vulnerabilities-patch-now)
-- [Patchstack — PHP major vulnerability alert 10/2026](https://patchstack.com/articles/php-major-vulnerability-alert-10-2026/)
+- [The Hacker News: PHP emergency patches for PHP2Shell RCE](https://thehackernews.com/2026/10/php-issues-emergency-patches-for-two.html)
+- [Qualys: find, mitigate, and patch PHP2Shell](https://blog.qualys.com/vulnerabilities-threat-research/2026/10/20/php-announces-critical-security-release-for-two-vulnerabilities)
+- [DigitalOcean: Critical PHP RCE, patch now](https://www.digitalocean.com/blog/critical-php-rce-vulnerabilities-patch-now)
+- [PHP: Informational advisory, session upload progress (CVE-2026-115560)](https://www.php.net/archive/2026.php)
+- [Patchstack: PHP major vulnerability alert 10/2026](https://patchstack.com/articles/php-major-vulnerability-alert-10-2026/)
 
 Detection guidance:
 
-- [Splunk Research — PHP session upload progress detections](https://research.splunk.com/web/47b3ff26-c4cc-4413-9bf3-f44dbac36785/)
-- [Abstract Security — PHP2Shell log artifacts](https://www.abstract.security/blog/php2shell-critical-php-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619)
-- [Bitdefender — PHP2Shell technical advisory](https://www.bitdefender.com/en-us/blog/businessinsights/technical-advisory-php2shell-pre-auth-rce)
-- [Zafran — PHP2Shell everything you need to know](https://www.zafran.io/resources/php2shell-everything-you-need-to-know-about-the-two-critical-php-vulnerabilities)
+- [Splunk Research: PHP session upload progress detections](https://research.splunk.com/web/47b3ff26-c4cc-4413-9bf3-f44dbac36785/)
+- [Abstract Security: PHP2Shell log artifacts](https://www.abstract.security/blog/php2shell-critical-php-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619)
+- [Bitdefender: PHP2Shell technical advisory](https://www.bitdefender.com/en-us/blog/businessinsights/technical-advisory-php2shell-pre-auth-rce)
+- [Zafran: PHP2Shell everything you need to know](https://www.zafran.io/resources/php2shell-everything-you-need-to-know-about-the-two-critical-php-vulnerabilities)
 
 > Version/fix data in this tool reflects the 2026-10-21 release. Always confirm
 > against [php.net](https://www.php.net/) for your exact branch.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
