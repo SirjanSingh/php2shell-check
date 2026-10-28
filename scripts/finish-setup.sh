@@ -9,7 +9,7 @@
 # Idempotent: safe to re-run.
 set -euo pipefail
 
-REPO="${REPO:-SirjanSingh/shiny-php}"
+REPO="${REPO:-SirjanSingh/php2shell-check}"
 
 echo "==> Setting repository description and topics on $REPO"
 gh repo edit "$REPO" \
@@ -35,7 +35,7 @@ cat <<'NOTE'
        pending publisher with EXACTLY:
          PyPI Project Name: php2shell-check
          Owner:             SirjanSingh
-         Repository name:   shiny-php
+         Repository name:   php2shell-check
          Workflow name:     release.yml
          Environment name:  pypi
 

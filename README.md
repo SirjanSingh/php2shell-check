@@ -1,6 +1,6 @@
 # php2shell-check
 
-[![CI](https://github.com/SirjanSingh/shiny-php/actions/workflows/ci.yml/badge.svg)](https://github.com/SirjanSingh/shiny-php/actions/workflows/ci.yml)
+[![CI](https://github.com/SirjanSingh/php2shell-check/actions/workflows/ci.yml/badge.svg)](https://github.com/SirjanSingh/php2shell-check/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)
@@ -26,7 +26,7 @@ October 21 patches do not fix.
 ## Respond in 60 seconds
 
 ```bash
-curl -sO https://raw.githubusercontent.com/SirjanSingh/shiny-php/main/php2shell_check.py
+curl -sO https://raw.githubusercontent.com/SirjanSingh/php2shell-check/main/php2shell_check.py
 python3 php2shell_check.py check      # Am I affected?
 python3 php2shell_check.py harden     # If so, exact fix for my OS
 # Then update PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 and re-check.
@@ -53,7 +53,7 @@ on those branches must move to a supported, patched branch.
 Single file, no dependencies, Python 3.9+:
 
 ```bash
-curl -O https://raw.githubusercontent.com/SirjanSingh/shiny-php/main/php2shell_check.py
+curl -O https://raw.githubusercontent.com/SirjanSingh/php2shell-check/main/php2shell_check.py
 chmod +x php2shell_check.py
 ```
 
@@ -62,7 +62,7 @@ Or install it as a command with `pipx` (or `pip`):
 ```bash
 pipx install php2shell-check          # from PyPI
 # or straight from source:
-pipx install git+https://github.com/SirjanSingh/shiny-php
+pipx install git+https://github.com/SirjanSingh/php2shell-check
 php2shell-check check
 ```
 

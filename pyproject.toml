@@ -23,9 +23,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/SirjanSingh/shiny-php"
-Issues = "https://github.com/SirjanSingh/shiny-php/issues"
-Changelog = "https://github.com/SirjanSingh/shiny-php/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/SirjanSingh/php2shell-check"
+Issues = "https://github.com/SirjanSingh/php2shell-check/issues"
+Changelog = "https://github.com/SirjanSingh/php2shell-check/blob/main/CHANGELOG.md"
 
 [project.scripts]
 php2shell-check = "php2shell_check:main"

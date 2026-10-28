@@ -847,7 +847,7 @@ def cmd_scan_code(args: argparse.Namespace) -> int:
 # --- SARIF output ------------------------------------------------------------
 # SARIF lets CI upload results to GitHub code scanning (Security tab).
 
-REPO_URL = "https://github.com/SirjanSingh/shiny-php"
+REPO_URL = "https://github.com/SirjanSingh/php2shell-check"
 _SARIF_LEVEL = {"high": "error", "medium": "warning", "low": "note"}
 
 

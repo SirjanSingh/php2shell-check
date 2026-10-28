@@ -17,8 +17,8 @@ project and we'd like to keep it that way.
 ## Developing
 
 ```bash
-git clone https://github.com/SirjanSingh/shiny-php
-cd shiny-php
+git clone https://github.com/SirjanSingh/php2shell-check
+cd php2shell-check
 python -m unittest discover tests -v
 ```
 

@@ -23,11 +23,16 @@ and prints the single PyPI step that must be done by hand (detailed below).
    **pending publisher** with exactly:
    - PyPI Project Name: `php2shell-check`
    - Owner: `SirjanSingh`
-   - Repository name: `shiny-php`
+   - Repository name: `php2shell-check`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
 3. In GitHub: **Settings → Environments → New environment** named `pypi`
    (optionally add a required reviewer so a human approves each publish).
+
+> **If the repo is ever renamed:** the PyPI publisher matches the repository name, so a
+> rename breaks publishing until the publisher on PyPI is updated (Manage project, Publishing).
+> The repo was renamed from `shiny-php` to `php2shell-check` after v0.2.0 shipped; update the
+> publisher's repository name before tagging the next release.
 
 That's it — no password or token goes anywhere near the repo.
 

@@ -25,7 +25,7 @@ Detection is not prevention. Update PHP to a patched release
 ## Reporting a vulnerability in this tool
 
 If you find a security issue in `php2shell-check` itself, please open a
-[GitHub issue](https://github.com/SirjanSingh/shiny-php/issues) for low-risk bugs,
+[GitHub issue](https://github.com/SirjanSingh/php2shell-check/issues) for low-risk bugs,
 or for anything sensitive, use GitHub's private vulnerability reporting on this
 repository. Please do not include working exploit payloads for PHP2Shell in
 public issues.

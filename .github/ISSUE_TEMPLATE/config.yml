@@ -4,5 +4,5 @@ contact_links:
     url: https://www.php.net/releases/
     about: Authoritative source for PHP patched versions.
   - name: Report a security issue in this tool
-    url: https://github.com/SirjanSingh/shiny-php/security/advisories/new
+    url: https://github.com/SirjanSingh/php2shell-check/security/advisories/new
     about: Use private vulnerability reporting for anything sensitive.
