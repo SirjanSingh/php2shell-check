@@ -930,7 +930,7 @@ class SessionHandlerTests(unittest.TestCase):
 class BackportTests(unittest.TestCase):
     def _ins(self, ver, cves, name="php8.2-cli"):
         ins = PhpInstall("/usr/bin/php8.2", f"PHP {ver}", assess(parse_version(ver)))
-        ins.package = PackageInfo("dpkg", name, ver + "-1+deb11u9", cves)
+        ins.package = PackageInfo("dpkg", name, ver + "-1", cves)
         return ins
 
     def test_changelog_cves(self):
@@ -967,6 +967,41 @@ class BackportTests(unittest.TestCase):
         self.assertTrue(ins.verdict.affected)
         self.assertTrue(any("changelog not available" in n for n in backport_notes(ins)))
 
+    def test_package_must_be_the_running_build(self):
+        # A source build (or COPY --from) over a packaged path: the package's
+        # changelog says nothing about the PHP that actually runs.
+        mismatch = ["package php8.2-cli 8.2.35-1 does not match running PHP 8.2.20; "
+                    "not treated as patched"]
+        for cves in (list(CVES), None):
+            with self.subTest(cves=cves):
+                ins = PhpInstall("/usr/bin/php8.2", "PHP 8.2.20", assess((8, 2, 20)))
+                ins.package = PackageInfo("dpkg", "php8.2-cli", "8.2.35-1", cves)
+                apply_backport(ins)
+                self.assertEqual(ins.verdict.status, STATUS_VULNERABLE)
+                self.assertEqual(backport_notes(ins), mismatch)
+        out = ("BIN /usr/bin/php\nVER PHP 8.2.20 (cli)\nPKG dpkg php8.2-cli 8.2.35-1\n"
+               "CVE CVE-2026-109618\nCVE CVE-2026-109619\n")
+        (ins,) = parse_remote_probe("h", out)
+        self.assertEqual(ins.verdict.status, STATUS_VULNERABLE)
+        self.assertEqual(backport_notes(ins), mismatch)
+
+    def test_vendor_release_and_epoch_forms_match_the_running_version(self):
+        for running, version in [((8, 0, 30), "8.0.30-8.el9_8.1"),         # RHEL
+                                  ((8, 0, 30), "8.0.30-8.el9_8.1.alma.1"),  # AlmaLinux
+                                  ((8, 0, 30), "1:8.0.30-8.el9_8.1"),       # epoch
+                                  ((7, 4, 33), "7.4.33-23.el9.remi")]:      # Remi EOL build
+            with self.subTest(version=version):
+                ins = PhpInstall("/usr/bin/php", "PHP", assess(running))
+                ins.package = PackageInfo("rpm", "php-cli", version, list(CVES))
+                apply_backport(ins)
+                self.assertEqual(ins.verdict.status, STATUS_PATCHED_BACKPORT)
+                self.assertEqual(backport_notes(ins), [])
+
+    def test_notes_never_say_missing_nothing(self):
+        # Both CVEs named but apply_backport not run: no "missing ;" line.
+        ins = self._ins("8.2.20", list(CVES))
+        self.assertNotIn("missing ;", " ".join(backport_notes(ins)))
+
     def test_no_package_no_notes(self):
         ins = PhpInstall("/usr/local/bin/php", "PHP 8.2.20", assess((8, 2, 20)))
         apply_backport(ins)
@@ -983,7 +1018,7 @@ class BackportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             os.makedirs(os.path.join(root, "php8.2-common"))
             with gzip.open(os.path.join(root, "php8.2-common", "changelog.Debian.gz"), "wt") as fh:
-                fh.write("php8.2 (8.2.20-1+deb11u9) bullseye-security; urgency=high\n"
+                fh.write("php8.2 (8.2.20-1) unstable; urgency=high\n"
                          "  * CVE-2026-109618 CVE-2026-109619\n")
             text = read_package_changelog(PackageInfo("dpkg", "php8.2-cli", "x", None), doc_root=root)
             self.assertEqual(changelog_cves(text), ["CVE-2026-109618", "CVE-2026-109619"])
@@ -992,12 +1027,12 @@ class BackportTests(unittest.TestCase):
     def test_package_for_binary_dpkg_and_rpm(self):
         def fake(cmd, **kw):
             out = {"dpkg": "php8.2-cli:amd64: /usr/bin/php8.2\n",
-                   "dpkg-query": "8.2.20-1+deb11u9"}.get(os.path.basename(cmd[0]), "")
+                   "dpkg-query": "8.2.20-1"}.get(os.path.basename(cmd[0]), "")
             return subprocess.CompletedProcess(cmd, 0 if out else 1, out, "")
         with mock.patch("php2shell_check.shutil.which", side_effect=lambda n: n if n.startswith("dpkg") else None), \
              mock.patch("php2shell_check.subprocess.run", side_effect=fake):
             pkg = package_for_binary("/usr/bin/php8.2")
-        self.assertEqual((pkg.manager, pkg.name, pkg.version), ("dpkg", "php8.2-cli", "8.2.20-1+deb11u9"))
+        self.assertEqual((pkg.manager, pkg.name, pkg.version), ("dpkg", "php8.2-cli", "8.2.20-1"))
 
         def fake_rpm(cmd, **kw):
             return subprocess.CompletedProcess(cmd, 0, "php-cli 8.0.30-8.el9_8.1", "")
@@ -1204,7 +1239,7 @@ class DockerProbeTests(unittest.TestCase):
 
     def test_cli_image_json_adds_install_keys(self):
         ins = parse_remote_probe("image php:8.2.20", "BIN /usr/bin/php8.2\nVER PHP 8.2.20 (cli)\n"
-                                 "PKG dpkg php8.2-cli 8.2.20-1+deb11u9\nCVE CVE-2026-109618\n"
+                                 "PKG dpkg php8.2-cli 8.2.20-1\nCVE CVE-2026-109618\n"
                                  "STALE 7 php-fpm8.2 binary replaced on disk (/usr/sbin/php-fpm8.2)\n")
         dockerfile = tempfile.NamedTemporaryFile("w", suffix="Dockerfile", delete=False)
         dockerfile.write("FROM php:8.4.27-cli\n")
@@ -1236,7 +1271,7 @@ class DockerProbeTests(unittest.TestCase):
 
     def test_cli_backport_label(self):
         ins = parse_remote_probe("image x", "BIN /usr/bin/php8.2\nVER PHP 8.2.20 (cli)\n"
-                                 "PKG dpkg php8.2-cli 8.2.20-1+deb11u9\n"
+                                 "PKG dpkg php8.2-cli 8.2.20-1\n"
                                  "CVE CVE-2026-109618\nCVE CVE-2026-109619\n")
         code, out, _ = self._cli(["scan-docker", "--image", "x"], ins)
         self.assertEqual(code, 0)

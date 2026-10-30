@@ -276,12 +276,20 @@ def read_package_changelog(pkg: PackageInfo, doc_root: str = "/usr/share/doc") -
     return None
 
 
+def _package_matches(ins: PhpInstall) -> bool:
+    """True when the package's upstream version (no epoch, no release) is the
+    version PHP itself reports. A source build or a COPY --from binary over a
+    packaged path runs other code than the package's changelog describes."""
+    upstream = parse_version(ins.package.version.split(":", 1)[-1].rsplit("-", 1)[0])
+    return upstream is not None and upstream == ins.verdict.version
+
+
 def apply_backport(ins: PhpInstall) -> None:
     """Upgrade an affected verdict to patched_backport when the owning
-    package's changelog names every CVE in CVES."""
+    package is the running build and its changelog names every CVE in CVES."""
     pkg = ins.package
     if not (ins.verdict.affected and pkg and pkg.cves is not None
-            and all(c in pkg.cves for c in CVES)):
+            and all(c in pkg.cves for c in CVES) and _package_matches(ins)):
         return
     old = ins.verdict
     ins.verdict = Verdict(
@@ -297,11 +305,16 @@ def backport_notes(ins: PhpInstall) -> list[str]:
     if not pkg or not ins.verdict.affected:
         return []
     who = f"package {_clean(pkg.name)} {_clean(pkg.version)}"
+    if not _package_matches(ins):
+        return [f"{who} does not match running PHP {ins.verdict.version_str}; "
+                f"not treated as patched"]
     if pkg.cves is None:
         return [f"{who}: changelog not available, cannot confirm a distro backport; "
                 f"check your vendor advisory"]
     found = ", ".join(pkg.cves) or "neither CVE"
     missing = ", ".join(c for c in CVES if c not in pkg.cves)
+    if not missing:
+        return []  # apply_backport upgrades this install; nothing to explain
     return [f"{who}: changelog names {found}, missing {missing}; not treated as patched"]
 
 
