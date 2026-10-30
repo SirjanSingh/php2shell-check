@@ -1354,9 +1354,11 @@ def scan_docker_files(paths: list) -> list:
 
 
 # Images and containers get the same read-only probe as SSH hosts, piped to
-# `sh -s` on stdin. Images run with `--network none`. One with no `sh`
+# `sh -s` on stdin. Images run with `--network none` and no capabilities. One with no `sh`
 # (distroless) falls back to `php -v`.
-_IMAGE_RE =re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+# Detail prefix of a probe that ran and found no PHP (as opposed to one that failed).
+_NO_PHP = "no PHP found"
 
 
 def _docker_probe(sh_cmd: list, php_cmd: list, label: str, timeout: int) -> list:
@@ -1389,8 +1391,13 @@ def _docker_probe(sh_cmd: list, php_cmd: list, label: str, timeout: int) -> list
     out = _clean((proc.stdout or "").replace("\r", ""))
     ver = parse_version(out) if proc.returncode == 0 else None
     if ver is None:
-        lines = _clean(proc.stderr or "").strip().splitlines()
-        return unknown(f"no PHP found (sh probe exit {sh_rc}, php -v exit "
+        stderr = _clean(proc.stderr or "")
+        lines = stderr.strip().splitlines()
+        # 126/127: the runtime could not start `sh`/`php` because it is not there.
+        missing = sh_rc in (0, 126, 127) and (proc.returncode in (126, 127)
+                                              or "executable file not found" in stderr)
+        what = _NO_PHP if missing else "docker probe failed"
+        return unknown(f"{what} (sh probe exit {sh_rc}, php -v exit "
                        f"{proc.returncode}): {lines[-1] if lines else 'no error output'}")
     first = out.strip().splitlines()[0]
     return [PhpInstall(f"{label}: php", first, assess(ver))]
@@ -1403,9 +1410,11 @@ def probe_image(image: str, timeout: int = 300) -> list:
     if not _IMAGE_RE.match(image):
         return [PhpInstall(label, "", Verdict(
             None, STATUS_UNKNOWN, f"not a plain image reference: {_clean(image)!r}"))]
+    hardening = ["--network", "none", "--cap-drop", "ALL",
+                 "--security-opt", "no-new-privileges"]
     return _docker_probe(
-        ["docker", "run", "--rm", "-i", "--network", "none", "--entrypoint", "sh", image, "-s"],
-        ["docker", "run", "--rm", "--network", "none", "--entrypoint", "php", image, "-v"],
+        ["docker", "run", "--rm", "-i", *hardening, "--entrypoint", "sh", image, "-s"],
+        ["docker", "run", "--rm", *hardening, "--entrypoint", "php", image, "-v"],
         label, timeout)
 
 
@@ -1433,8 +1442,10 @@ def scan_running_containers() -> tuple:
         cid, name, image = parts
         label = f"container {name}"
         for ins in probe_container(cid, name):
-            # A container with no PHP binary (a database, a proxy) is not a finding.
-            if ins.binary == label and not ins.stale:
+            # A container with no PHP binary (a database, a proxy) is not a finding;
+            # a probe that failed (timeout, exec refused) is, as UNKNOWN.
+            if (ins.binary == label and not ins.stale
+                    and ins.verdict.detail.startswith(_NO_PHP)):
                 continue
             hits.append(DockerHit(f"{label} ({image})", 0, image, ins.verdict, install=ins))
     return hits, None
@@ -1461,6 +1472,7 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
         rows = []
         for h in hits:
             row = {"source": h.source, "line": h.line_no, "image": h.image_tag,
+                   "binary": h.install.binary if h.install else None,
                    "version": h.verdict.version_str, "status": h.verdict.status,
                    "affected": h.verdict.affected, "detail": h.verdict.detail}
             if h.install:

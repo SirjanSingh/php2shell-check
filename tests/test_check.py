@@ -968,6 +968,8 @@ class DockerProbeTests(unittest.TestCase):
         self.assertEqual(cmd[:2], ["docker", "run"])
         self.assertEqual(cmd[cmd.index("--network") + 1], "none")
         self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "sh")
+        self.assertEqual(cmd[cmd.index("--cap-drop") + 1], "ALL")
+        self.assertEqual(cmd[cmd.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual(cmd[-2:], ["php:8.3.10-fpm", "-s"])
         self.assertNotIn("shell", run.call_args.kwargs)
         self.assertEqual(run.call_args.kwargs["input"], build_remote_probe())
@@ -983,6 +985,8 @@ class DockerProbeTests(unittest.TestCase):
         cmd = run.call_args_list[1].args[0]
         self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "php")
         self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+        self.assertEqual(cmd[cmd.index("--cap-drop") + 1], "ALL")
+        self.assertEqual(cmd[cmd.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual(cmd[-1], "-v")
 
     def test_probe_image_no_php_is_unknown(self):
@@ -1066,6 +1070,25 @@ class DockerProbeTests(unittest.TestCase):
         self.assertEqual([h.source for h in hits], ["container app (php-distroless)"])
         self.assertEqual(hits[0].verdict.status, STATUS_PATCHED)
 
+    def test_running_container_probe_timeout_is_unknown(self):
+        ps = subprocess.CompletedProcess(["docker"], 0, "abc123\tweb\tphp:8.3-fpm\n", "")
+        with mock.patch("php2shell_check.shutil.which", return_value="/usr/bin/docker"), \
+                mock.patch("php2shell_check.subprocess.run",
+                           side_effect=[ps, subprocess.TimeoutExpired("docker", 60)]):
+            hits, note = scan_running_containers()
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].source, "container web (php:8.3-fpm)")
+        self.assertEqual(hits[0].verdict.status, STATUS_UNKNOWN)
+        self.assertIn("timed out", hits[0].verdict.detail)
+
+    def test_running_container_exec_failure_is_unknown(self):
+        gone = "Error response from daemon: container abc123 is not running\n"
+        self._run((0, "abc123\tweb\tphp:8.3-fpm\n", ""), (1, "", gone), (1, "", gone))
+        hits, note = scan_running_containers()
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].verdict.status, STATUS_UNKNOWN)
+        self.assertIn("is not running", hits[0].verdict.detail)
+
     def _cli(self, argv, installs):
         out = io.StringIO()
         with mock.patch("php2shell_check.probe_image", return_value=installs) as probe, \
@@ -1087,8 +1110,10 @@ class DockerProbeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         doc = json.loads(out)
         file_hit, image_hit = doc["hits"][0], doc["hits"][1]
-        self.assertEqual(set(file_hit), {"source", "line", "image", "version", "status",
-                                         "affected", "detail"})
+        self.assertEqual(set(file_hit), {"source", "line", "image", "binary", "version",
+                                         "status", "affected", "detail"})
+        self.assertIsNone(file_hit["binary"])
+        self.assertEqual(image_hit["binary"], "image php:8.2.20: /usr/bin/php8.2")
         self.assertEqual(image_hit["package"]["name"], "php8.2-cli")
         self.assertEqual(image_hit["stale_processes"][0]["pids"], [7])
         self.assertTrue(any("CVE-2026-109619" in n for n in image_hit["backport_notes"]))
