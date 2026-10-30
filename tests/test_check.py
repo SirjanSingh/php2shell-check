@@ -1247,5 +1247,108 @@ class ReportTests(unittest.TestCase):
             self.assertIn("r.md", err.getvalue())
 
 
+class GithubActionTests(unittest.TestCase):
+    """action.yml: its inputs, and its run script executed for real under bash
+    with fake GITHUB_* files, as the runner would execute the step."""
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        if yaml is None:
+            raise unittest.SkipTest("PyYAML not installed")
+        with open(os.path.join(cls.REPO, "action.yml"), encoding="utf-8") as fh:
+            cls.action = yaml.safe_load(fh)
+        cls.scan_step = next(s for s in cls.action["runs"]["steps"] if s.get("id") == "scan")
+
+    def test_declares_inputs_defaults_and_output(self):
+        inputs = self.action["inputs"]
+        self.assertEqual(inputs["command"]["default"], "scan-docker")
+        self.assertEqual(inputs["args"]["default"], "")
+        self.assertEqual(inputs["fail-on"]["default"], "")
+        self.assertEqual(inputs["python-version"]["default"], "3.13")
+        self.assertIn("exit-code", self.action["outputs"])
+        self.assertEqual(self.action["runs"]["using"], "composite")
+
+    def test_inputs_reach_the_script_only_through_env(self):
+        # `${{ }}` inside run: is the script-injection pattern GitHub warns about.
+        self.assertNotIn("${{", self.scan_step["run"])
+        self.assertEqual(self.scan_step["env"], {
+            "P2S_COMMAND": "${{ inputs.command }}",
+            "P2S_ARGS": "${{ inputs.args }}",
+            "P2S_FAIL_ON": "${{ inputs.fail-on }}",
+        })
+
+    def run_script(self, d, command, args="", fail_on=""):
+        """Run the step's script as the runner does (bash -eo pipefail), with
+        `python` pointing at this interpreter and the GITHUB_* files in `d`."""
+        bindir = os.path.join(d, "bin")
+        os.makedirs(bindir)
+        os.symlink(sys.executable, os.path.join(bindir, "python"))
+        runner_temp = os.path.join(d, "runner-temp")
+        os.makedirs(runner_temp)
+        script = os.path.join(d, "step.sh")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(self.scan_step["run"])
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
+                   GITHUB_ACTION_PATH=self.REPO, RUNNER_TEMP=runner_temp,
+                   GITHUB_STEP_SUMMARY=os.path.join(d, "summary.md"),
+                   GITHUB_OUTPUT=os.path.join(d, "output.txt"),
+                   P2S_COMMAND=command, P2S_ARGS=args, P2S_FAIL_ON=fail_on)
+        proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script],
+                              cwd=d, env=env, capture_output=True, text=True, timeout=120)
+
+        def read(name):
+            path = os.path.join(d, name)
+            if not os.path.exists(path):
+                return ""
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        return proc, read("summary.md"), read("output.txt")
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs bash")
+    def test_check_fails_the_step_and_writes_summary_and_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, summary, output = self.run_script(d, "check", "--version 8.3.10")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(output, "exit-code=1\n")
+        self.assertIn("1 affected", summary)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs bash")
+    def test_fail_on_none_exits_0(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, _, output = self.run_script(d, "check", "--version 8.3.10", fail_on="none")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(output, "exit-code=0\n")
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs bash")
+    def test_scan_docker_writes_summary_for_a_dockerfile(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "Dockerfile.ci"), "w", encoding="utf-8") as fh:
+                fh.write("FROM php:8.3.10-fpm\n")
+            proc, summary, output = self.run_script(d, "scan-docker", "Dockerfile.ci")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(output, "exit-code=1\n")
+        self.assertIn("1 affected", summary)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs bash")
+    def test_other_commands_get_no_markdown_flag(self):
+        # scan-code has no --markdown; passing one would be a usage error (exit 2).
+        with tempfile.TemporaryDirectory() as d:
+            proc, summary, output = self.run_script(d, "scan-code", ".", fail_on="none")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(summary, "")
+        self.assertEqual(output, "exit-code=0\n")
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs bash")
+    def test_unknown_command_exits_2_and_writes_no_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, summary, output = self.run_script(d, "scan-everything")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("command must be", proc.stdout)
+        self.assertEqual(summary, "")
+        self.assertEqual(output, "")
+
+
 if __name__ == "__main__":
     unittest.main()
