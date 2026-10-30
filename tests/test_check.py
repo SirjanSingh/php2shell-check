@@ -778,10 +778,6 @@ class SessionHandlerTests(unittest.TestCase):
             self.assertEqual(main(["scan-code", "/no/such/path"]), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BackportTests(unittest.TestCase):
     def _ins(self, ver, cves, name="php8.2-cli"):
         ins = PhpInstall("/usr/bin/php8.2", f"PHP {ver}", assess(parse_version(ver)))
@@ -875,3 +871,7 @@ class BackportTests(unittest.TestCase):
         ins = self._inspect(None)
         self.assertTrue(ins.verdict.affected)
         self.assertIsNone(ins.package.cves)
+
+
+if __name__ == "__main__":
+    unittest.main()
