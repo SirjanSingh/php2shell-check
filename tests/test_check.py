@@ -57,6 +57,7 @@ from php2shell_check import (  # noqa: E402
     scan_code_file,
     iter_code_files,
     main,
+    CVES,
     LINE_INDICATORS,
     RULE_FILENAMES,
     _RULE_SPECS,
@@ -646,6 +647,80 @@ class SshFleetTests(unittest.TestCase):
         self.assertEqual(installs[0].config["memory_limit"], "128M")
         self.assertEqual([(s.name, s.pids) for s in installs[0].stale],
                          [("php-fpm8.4", [100])])
+
+    def test_parse_remote_probe_backport(self):
+        out = ("BIN /usr/bin/php\nVER PHP 8.0.30 (cli)\nPKG rpm php-cli 8.0.30-8.el9_8.1\n"
+               "CVE CVE-2026-109618\nCVE CVE-2026-109619\n")
+        (ins,) = parse_remote_probe("web01", out)
+        self.assertEqual(ins.verdict.status, STATUS_PATCHED_BACKPORT)
+        self.assertEqual(ins.package.name, "php-cli")
+
+    def test_parse_remote_probe_nochangelog(self):
+        out = "BIN /usr/bin/php\nVER PHP 8.2.20 (cli)\nPKG dpkg php8.2-cli 8.2.20-1\nNOCHANGELOG\n"
+        (ins,) = parse_remote_probe("web01", out)
+        self.assertTrue(ins.verdict.affected)
+        self.assertIsNone(ins.package.cves)
+
+    def test_parse_remote_probe_one_cve_is_not_enough(self):
+        out = ("BIN /usr/bin/php\nVER PHP 8.2.20 (cli)\nPKG dpkg php8.2-cli 8.2.20-1\n"
+               "CVE CVE-2026-109618\n")
+        (ins,) = parse_remote_probe("web01", out)
+        self.assertTrue(ins.verdict.affected)
+        self.assertEqual(ins.package.cves, ["CVE-2026-109618"])
+
+    def test_parse_remote_probe_rejects_untrusted_package_lines(self):
+        for pkg in ("PKG dpkg ;rm-rf 8.2.20-1", "PKG apt php8.2-cli 8.2.20-1",
+                    "PKG dpkg php8.2-cli", "PKG dpkg"):
+            with self.subTest(pkg=pkg):
+                out = f"BIN /usr/bin/php\nVER PHP 8.2.20 (cli)\n{pkg}\nCVE CVE-2026-109618\nCVE CVE-2026-109619\n"
+                (ins,) = parse_remote_probe("web01", out)
+                self.assertIsNone(ins.package)
+                self.assertTrue(ins.verdict.affected)
+
+    def test_parse_remote_probe_ignores_unknown_cve_ids(self):
+        out = ("BIN /usr/bin/php\nVER PHP 8.2.20 (cli)\nPKG dpkg php8.2-cli 8.2.20-1\n"
+               "CVE CVE-2026-109618\nCVE CVE-1999-0001\nCVE CVE-2026-109618\n")
+        (ins,) = parse_remote_probe("web01", out)
+        self.assertEqual(ins.package.cves, ["CVE-2026-109618"])
+
+    def test_probe_uses_cves_as_single_source(self):
+        script = build_remote_probe()
+        self.assertIn("|".join(CVES), script)  # no ERE metacharacters to escape
+        self.assertNotIn("@CVE_RE@", script)
+        self.assertNotIn("@DOC@", script)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
+    def test_probe_script_reads_fake_dpkg_changelog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            os.makedirs(os.path.join(tmp, "proc"))
+            docdir = os.path.join(tmp, "doc", "php8.2-common")
+            os.makedirs(docdir)
+            with gzip.open(os.path.join(docdir, "changelog.Debian.gz"), "wt") as fh:
+                fh.write("php8.2 (8.2.20-1+deb12u1) bookworm-security; urgency=high\n"
+                         "  * Fix CVE-2026-109618 and CVE-2026-109619\n")
+
+            def script(name, body):
+                path = os.path.join(bindir, name)
+                with open(path, "w") as fh:
+                    fh.write("#!/bin/sh\n" + body)
+                os.chmod(path, 0o755)
+
+            script("php", 'case "$1" in -v) echo "PHP 8.2.20 (cli)" ;; esac\n')
+            script("dpkg", 'echo "php8.2-cli: $2"\n')
+            script("dpkg-query", 'printf %s "8.2.20-1+deb12u1"\n')
+            env = dict(os.environ, PATH=bindir + os.pathsep + "/usr/bin:/bin")
+            out = subprocess.run(
+                ["sh", "-s"],
+                input=build_remote_probe(os.path.join(tmp, "proc"), os.path.join(tmp, "doc")),
+                capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("PKG dpkg php8.2-cli 8.2.20-1+deb12u1", out.stdout)
+        self.assertIn("CVE CVE-2026-109618", out.stdout)
+        self.assertIn("CVE CVE-2026-109619", out.stdout)
+        (ins,) = parse_remote_probe("h", out.stdout)
+        self.assertEqual(ins.verdict.status, STATUS_PATCHED_BACKPORT)
 
 
 class FailOnTests(unittest.TestCase):

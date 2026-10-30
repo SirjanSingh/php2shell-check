@@ -1427,6 +1427,19 @@ for name in @NAMES@; do
   echo "BIN $p"
   "$p" -v 2>&1 | head -n 1 | sed 's/^/VER /'
   "$p" -i 2>/dev/null | grep -E '^(session\.upload_progress\.(enabled|cleanup)|session\.serialize_handler|post_max_size|memory_limit|fatal_error_backtraces) =>' | sed 's/^/INI /'
+  real=$(readlink -f "$p" 2>/dev/null || echo "$p")
+  if command -v dpkg >/dev/null 2>&1 && pkg=$(dpkg -S "$real" 2>/dev/null | head -n 1 | cut -d: -f1 | cut -d, -f1) && [ -n "$pkg" ]; then
+    echo "PKG dpkg $pkg $(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
+    cl=""
+    for d in "$pkg" "$(echo "$pkg" | sed 's/-[a-z]*$/-common/')"; do
+      [ -r "@DOC@/$d/changelog.Debian.gz" ] && { cl="@DOC@/$d/changelog.Debian.gz"; break; }
+    done
+    if [ -n "$cl" ]; then gzip -dc "$cl" 2>/dev/null | grep -oE '@CVE_RE@' | sort -u | sed 's/^/CVE /'; else echo NOCHANGELOG; fi
+  elif command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf --qf '%{NAME} %{VERSION}-%{RELEASE}' "$real" 2>/dev/null); then
+    echo "PKG rpm $pkg"
+    cl=$(rpm -q --changelog "${pkg%% *}" 2>/dev/null)
+    if [ -n "$cl" ]; then printf '%s\n' "$cl" | grep -oE '@CVE_RE@' | sort -u | sed 's/^/CVE /'; else echo NOCHANGELOG; fi
+  fi
 done
 for d in "$PROC"/[0-9]*; do
   pid=${d##*/}
@@ -1451,9 +1464,13 @@ exit 0
 """
 
 
-def build_remote_probe(proc_root: str = "/proc") -> str:
+def build_remote_probe(proc_root: str = "/proc", doc_root: str = "/usr/share/doc") -> str:
+    # Escape ERE metacharacters only: grep 3.8+ warns about a stray `\-`.
+    cve_re = "|".join(re.sub(r"[.^$*+?()\[\]{}|\\]", r"\\\g<0>", c) for c in CVES)
     return (_REMOTE_PROBE_TEMPLATE.replace("@PROC@", proc_root)
-            .replace("@NAMES@", " ".join(PHP_CANDIDATES)))
+            .replace("@NAMES@", " ".join(PHP_CANDIDATES))
+            .replace("@DOC@", doc_root)
+            .replace("@CVE_RE@", cve_re))
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:%-]*$")
@@ -1491,9 +1508,10 @@ def _clean(text: str) -> str:
 
 
 def parse_remote_probe(host: str, text: str) -> list:
-    """Turn the probe's `BIN`/`VER`/`INI`/`STALE` lines into PhpInstall records
-    (one per binary). Restart findings belong to the host: they are attached to
-    its first record, or to a placeholder when no PHP binary was found."""
+    """Turn the probe's `BIN`/`VER`/`INI`/`PKG`/`CVE`/`NOCHANGELOG`/`STALE`
+    lines into PhpInstall records (one per binary). Restart findings belong to
+    the host: they are attached to its first record, or to a placeholder when
+    no PHP binary was found."""
     text = _clean(text.replace("\r", ""))
     installs: list = []
     stale_groups: dict = {}
@@ -1505,6 +1523,7 @@ def parse_remote_probe(host: str, text: str) -> list:
             current.config = parse_ini_posture("\n".join(ini_lines))
             current.upload_progress_enabled = _ini_bool(
                 current.config.get("session.upload_progress.enabled"))
+            apply_backport(current)
 
     for line in text.splitlines():
         tag, _, rest = line.partition(" ")
@@ -1518,6 +1537,18 @@ def parse_remote_probe(host: str, text: str) -> list:
             current.verdict = assess(parse_version(rest))
         elif tag == "INI" and current is not None:
             ini_lines.append(rest)
+        elif tag == "PKG" and current is not None:
+            parts = rest.split()
+            if (len(parts) == 3 and parts[0] in ("dpkg", "rpm")
+                    and _PKG_NAME_RE.fullmatch(parts[1])):
+                current.package = PackageInfo(parts[0], parts[1], _clean(parts[2]), [])
+        elif tag == "CVE" and current is not None and current.package is not None:
+            cve = rest.strip()
+            cves = current.package.cves
+            if cve in CVES and cves is not None and cve not in cves:
+                current.package.cves = sorted(cves + [cve])
+        elif tag == "NOCHANGELOG" and current is not None and current.package is not None:
+            current.package.cves = None
         elif tag == "STALE":
             parts = rest.split(None, 2)
             if len(parts) == 3 and parts[0].isdigit():
