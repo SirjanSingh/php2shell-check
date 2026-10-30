@@ -1418,8 +1418,9 @@ def _docker_probe(sh_cmd: list, php_cmd: list, label: str, timeout: int) -> list
     if ver is None:
         stderr = _clean(proc.stderr or "")
         lines = stderr.strip().splitlines()
-        # 126/127: the runtime could not start `sh`/`php` because it is not there.
-        missing = sh_rc in (0, 126, 127) and (proc.returncode in (126, 127)
+        # 127 (or docker exec's 126 with "executable file not found"): `php` is
+        # not there. Any other 126 means it is there but cannot be invoked.
+        missing = sh_rc in (0, 126, 127) and (proc.returncode == 127
                                               or "executable file not found" in stderr)
         what = _NO_PHP if missing else "docker probe failed"
         return unknown(f"{what} (sh probe exit {sh_rc}, php -v exit "

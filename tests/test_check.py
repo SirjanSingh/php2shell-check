@@ -1137,6 +1137,19 @@ class DockerProbeTests(unittest.TestCase):
         self.assertEqual(installs[0].verdict.status, STATUS_UNKNOWN)
         self.assertIn("executable file not found", installs[0].verdict.detail)
 
+    def test_php_that_cannot_be_invoked_is_not_no_php(self):
+        # 126 is "found but cannot run" (e.g. permission denied): a finding, not a skip.
+        denied = 'exec: "php": permission denied\n'
+        self._run((0, "", ""), (126, "", denied))
+        (ins,) = probe_image("example/php:8.3")
+        self.assertEqual(ins.verdict.status, STATUS_UNKNOWN)
+        self.assertTrue(ins.verdict.detail.startswith("docker probe failed"), ins.verdict.detail)
+        self.assertIn("permission denied", ins.verdict.detail)
+        self._run((0, "abc123\tapp\texample/php:8.3\n", ""), (0, "", ""), (126, "", denied))
+        hits, _ = scan_running_containers()
+        self.assertEqual([h.source for h in hits], ["container app (example/php:8.3)"])
+        self.assertIn("permission denied", hits[0].verdict.detail)
+
     def test_option_like_image_rejected_before_docker(self):
         with mock.patch("php2shell_check.subprocess.run") as run:
             (ins,) = probe_image("--privileged")
