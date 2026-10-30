@@ -1163,6 +1163,12 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("—", render_markdown("t", rows, "now"))
         self.assertNotIn("—", render_html("t", rows, "now"))
 
+    def test_html_css_never_breaks_inside_short_words(self):
+        css = render_html("t", self._rows(), "now").lower()
+        self.assertNotIn("break-all", css)
+        self.assertNotRegex(css, r"overflow-wrap:\s*anywhere")
+        self.assertRegex(css, r"th\s*\{[^}]*white-space:\s*nowrap")
+
     def test_markdown_escapes_pipes(self):
         r = ReportRow("a|b", "local", "8.3.10", "vulnerable", "x", [])
         self.assertIn("a\\|b", render_markdown("t", [r], "now"))

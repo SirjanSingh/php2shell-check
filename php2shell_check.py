@@ -1889,10 +1889,10 @@ h1 { font-size: 1.5rem; margin: 0 0 4px; }
 .meta { color: var(--muted); margin: 0 0 20px; font-size: 0.9rem; }
 .scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; }
-table { border-collapse: collapse; width: 100%; min-width: 40rem; }
+table { border-collapse: collapse; width: 100%; min-width: 44rem; }
 th, td { text-align: left; vertical-align: top; padding: 10px 12px;
-  border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
-th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  border-bottom: 1px solid var(--border); overflow-wrap: break-word; }
+th { white-space: nowrap; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
 tr:last-child td { border-bottom: 0; }
 .ver { white-space: nowrap; }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem;
