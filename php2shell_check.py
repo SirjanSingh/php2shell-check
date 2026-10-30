@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import html
 import json
 import os
 import re
@@ -55,6 +56,7 @@ import sys
 import uuid
 import zlib
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Optional
 
 __version__ = "0.2.0"
@@ -1465,6 +1467,10 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
     def stale(h: DockerHit) -> bool:
         return bool(h.install and h.install.stale)
 
+    report_err = write_reports(args, "PHP2Shell Docker scan", rows_from_hits(hits))
+    if report_err:
+        print(report_err, file=sys.stderr)
+
     affected = [h for h in hits if h.verdict.affected or stale(h)]
     unknown = [h for h in hits if h.verdict.status == STATUS_UNKNOWN]
 
@@ -1490,7 +1496,7 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
             print(f"  note: {note}\n")
         if not hits:
             print("  No PHP images found. Pass Dockerfile/compose paths, --image, or --running.")
-            return 0
+            return 2 if report_err else 0
         for h in hits:
             tag = ("AFFECTED" if h.verdict.affected else
                    "OK" if h.verdict.status == STATUS_PATCHED else
@@ -1516,7 +1522,7 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
         default = 0
     sevs = ["high" if h.verdict.affected or stale(h) else "medium"
             for h in hits if h.verdict.affected or stale(h) or h.verdict.status == STATUS_UNKNOWN]
-    return exit_code_for(sevs, args.fail_on, default)
+    return 2 if report_err else exit_code_for(sevs, args.fail_on, default)
 
 
 # --- SSH fleet mode ----------------------------------------------------------
@@ -1714,6 +1720,247 @@ def scan_ssh_hosts(path: str, jobs: int = 8) -> list:
     return installs
 
 
+# --- reports -----------------------------------------------------------------
+#
+# --markdown / --html write the same findings to a file as well as the normal
+# output, so a CI job can attach them (Markdown renders in a GitHub job summary).
+
+@dataclass
+class ReportRow:
+    target: str
+    source: str  # "local" | "ssh" | "inventory" | "version" | "dockerfile" | "image" | "container"
+    version: Optional[str]
+    status: str
+    detail: str
+    notes: list = field(default_factory=list)
+
+
+STATUS_RESTART = "restart_needed"
+# Worst first; also the order of the report table.
+_STATUS_ORDER = (STATUS_VULNERABLE, STATUS_VULNERABLE_EOL, STATUS_RESTART,
+                 STATUS_UNKNOWN, STATUS_PATCHED_BACKPORT, STATUS_PATCHED)
+_STATUS_LABEL = {
+    STATUS_VULNERABLE: "vulnerable",
+    STATUS_VULNERABLE_EOL: "vulnerable (EOL)",
+    STATUS_RESTART: "restart needed",
+    STATUS_UNKNOWN: "unknown",
+    STATUS_PATCHED_BACKPORT: "patched (backport)",
+    STATUS_PATCHED: "patched",
+}
+_STATUS_CLASS = {
+    STATUS_VULNERABLE: "bad", STATUS_VULNERABLE_EOL: "bad",
+    STATUS_RESTART: "warn", STATUS_UNKNOWN: "warn",
+    STATUS_PATCHED_BACKPORT: "ok", STATUS_PATCHED: "ok",
+}
+
+
+def _stale_line(sp: StaleProcess) -> str:
+    pids = ", ".join(map(str, sp.pids[:8])) + (", ..." if len(sp.pids) > 8 else "")
+    return f"{sp.name} (pid {pids}): {sp.reason}"
+
+
+def _install_notes(ins: PhpInstall) -> list:
+    notes = backport_notes(ins) + posture_notes(ins) + session_handler_notes(ins)
+    notes += [f"restart needed: {_stale_line(sp)}" for sp in ins.stale]
+    return notes
+
+
+def _row_status(verdict: Verdict, stale: list) -> str:
+    # An affected build stays affected: the fix is the upgrade plus a restart.
+    if stale and not verdict.affected:
+        return STATUS_RESTART
+    return verdict.status
+
+
+def _row_detail(verdict: Verdict, stale: list) -> str:
+    if stale and not verdict.affected:
+        return ("Processes still run PHP code replaced on disk; restart them. "
+                + verdict.detail)
+    return verdict.detail
+
+
+def rows_from_installs(installs: list, source: str, stale: Optional[list] = None) -> list:
+    rows = [ReportRow(_clean(i.binary), source, i.verdict.version_str or _clean(i.raw_version) or None,
+                      _row_status(i.verdict, i.stale), _clean(_row_detail(i.verdict, i.stale)),
+                      [_clean(n) for n in _install_notes(i)])
+            for i in installs]
+    if stale:
+        rows.append(ReportRow(
+            "running PHP processes", "local", None, STATUS_RESTART,
+            "Processes are still running PHP code that was replaced on disk. Restart "
+            "php-fpm / apache2 / your PHP service, then re-check.",
+            [_clean(_stale_line(sp)) for sp in stale]))
+    return rows
+
+
+def rows_from_hits(hits: list) -> list:
+    rows = []
+    for h in hits:
+        ins = h.install
+        if ins:
+            tag = _clean(h.image_tag)
+            target = _clean(ins.binary) + ("" if tag in ins.binary else f" ({tag})")
+            source = "image" if h.source.startswith("image ") else "container"
+            notes = _install_notes(ins)
+            stale = ins.stale
+        else:
+            target = f"{_clean(h.source)}:{h.line_no} ({_clean(h.image_tag)})"
+            source, notes, stale = "dockerfile", [], []
+        rows.append(ReportRow(target, source, h.verdict.version_str,
+                              _row_status(h.verdict, stale), _clean(_row_detail(h.verdict, stale)),
+                              [_clean(n) for n in notes]))
+    return rows
+
+
+def _summary_counts(rows: list) -> list:
+    def n(*statuses: str) -> int:
+        return sum(r.status in statuses for r in rows)
+
+    parts = [(n(STATUS_VULNERABLE, STATUS_VULNERABLE_EOL), "affected"),
+             (n(STATUS_RESTART), "restart needed"),
+             (n(STATUS_UNKNOWN), "unknown"),
+             (n(STATUS_PATCHED, STATUS_PATCHED_BACKPORT), "patched")]
+    return [f"{c} {word}" for c, word in parts if c]
+
+
+def _sorted_rows(rows: list) -> list:
+    rank = {s: i for i, s in enumerate(_STATUS_ORDER)}
+    return sorted(rows, key=lambda r: rank.get(r.status, len(rank)))  # stable
+
+
+def _md(text: str) -> str:
+    """Make untrusted text safe inside a Markdown table cell or list item."""
+    text = html.escape(_clean(str(text)).replace("—", "-"), quote=False)
+    for ch in ("\\", "`", "|", "*", "_", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return " ".join(text.split())
+
+
+def render_markdown(title: str, rows: list, generated_at: str) -> str:
+    out = [f"## {_md(title)}", ""]
+    out.append(" · ".join(_summary_counts(rows)) if rows else "No PHP installs found.")
+    out += ["", f"Generated {_md(generated_at)}. Checked against {', '.join(CVES)}.", ""]
+    rows = _sorted_rows(rows)
+    if rows:
+        out += ["| Status | Target | Version | Detail |", "| --- | --- | --- | --- |"]
+        for r in rows:
+            out.append(f"| {_STATUS_LABEL.get(r.status, _md(r.status))} | {_md(r.target)} "
+                       f"| {_md(r.version or '')} | {_md(r.detail)} |")
+        out.append("")
+    for r in rows:
+        if r.notes:
+            plural = "s" if len(r.notes) != 1 else ""
+            out += ["<details>",
+                    f"<summary>{html.escape(_clean(r.target), quote=False)} "
+                    f"({len(r.notes)} note{plural})</summary>", ""]
+            out += [f"- {_md(n)}" for n in r.notes]
+            out += ["", "</details>", ""]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+_FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+            "%3Cpath d='M16 2l11 4v9c0 7-4.6 12.5-11 15C9.6 27.5 5 22 5 15V6z' fill='%230f766e'/%3E"
+            "%3Cpath d='M10.5 16l4 4 7-8' fill='none' stroke='%23ffffff' stroke-width='2.5' "
+            "stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+
+_HTML_CSS = """
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --fg: #1b1f24; --muted: #5b6573; --border: #d6dbe1;
+  --bad-bg: #fde4e1; --bad-fg: #9b1c12;
+  --warn-bg: #fdf0c8; --warn-fg: #7a4b00;
+  --ok-bg: #d9f2e1; --ok-fg: #14602c;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d; --surface: #1c2229; --fg: #e6e9ed; --muted: #9aa5b2; --border: #323b46;
+    --bad-bg: #4a1d19; --bad-fg: #ffb4ab;
+    --warn-bg: #45350d; --warn-fg: #f5cf73;
+    --ok-bg: #173a24; --ok-fg: #95dca9;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+.summary { font-size: 1.05rem; margin: 8px 0 4px; }
+.meta { color: var(--muted); margin: 0 0 20px; font-size: 0.9rem; }
+.scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 40rem; }
+th, td { text-align: left; vertical-align: top; padding: 10px 12px;
+  border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+.ver { white-space: nowrap; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem;
+  font-weight: 600; white-space: nowrap; }
+.bad { background: var(--bad-bg); color: var(--bad-fg); }
+.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.ok { background: var(--ok-bg); color: var(--ok-fg); }
+details { margin-top: 6px; color: var(--muted); }
+summary { cursor: pointer; }
+ul { margin: 6px 0 0; padding-left: 20px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+"""
+
+
+def render_html(title: str, rows: list, generated_at: str) -> str:
+    def esc(value) -> str:
+        return html.escape(_clean(str(value)).replace("—", "-"), quote=True)
+
+    rows = _sorted_rows(rows)
+    body = []
+    if rows:
+        body.append('<div class="scroll"><table>\n<thead><tr><th>Status</th><th>Target</th>'
+                    '<th class="ver">Version</th><th>Detail</th></tr></thead>\n<tbody>')
+        for r in rows:
+            cls = _STATUS_CLASS.get(r.status, "warn")
+            label = _STATUS_LABEL.get(r.status, r.status)
+            notes = ""
+            if r.notes:
+                plural = "s" if len(r.notes) != 1 else ""
+                notes = (f"<details><summary>{len(r.notes)} note{plural}</summary><ul>"
+                         + "".join(f"<li>{esc(n)}</li>" for n in r.notes) + "</ul></details>")
+            body.append(f'<tr><td><span class="pill {cls}">{esc(label)}</span></td>'
+                        f"<td><code>{esc(r.target)}</code></td><td class='ver'>{esc(r.version or '')}</td>"
+                        f"<td>{esc(r.detail)}{notes}</td></tr>")
+        body.append("</tbody></table></div>")
+    summary = " · ".join(_summary_counts(rows)) if rows else "No PHP installs found."
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<title>PHP2Shell report</title>\n'
+        f'<link rel="icon" href="{_FAVICON}">\n<style>{_HTML_CSS}</style>\n</head>\n<body>\n<main>\n'
+        f'<h1>{esc(title)}</h1>\n<p class="summary">{esc(summary)}</p>\n'
+        f'<p class="meta">Generated {esc(generated_at)}. Checked against {esc(", ".join(CVES))}.</p>\n'
+        + "\n".join(body) + "\n</main>\n</body>\n</html>\n")
+
+
+def write_reports(args: argparse.Namespace, title: str, rows: list) -> Optional[str]:
+    """Write --markdown / --html if given. Returns an error message, or None."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for path, render in ((getattr(args, "markdown", None), render_markdown),
+                         (getattr(args, "html", None), render_html)):
+        if not path:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(render(title, rows, now))
+        except OSError as exc:
+            return f"could not write report {path}: {exc.strerror or exc}"
+    return None
+
+
+def add_report_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--markdown", metavar="FILE",
+                        help="also write a Markdown report (renders in a GitHub job summary)")
+    parser.add_argument("--html", metavar="FILE",
+                        help="also write a self-contained HTML report")
+
+
 # --- exit codes / --fail-on --------------------------------------------------
 
 FAIL_ON_CHOICES = ("high", "medium", "low", "none")
@@ -1767,11 +2014,14 @@ def add_fail_on(parser: argparse.ArgumentParser) -> None:
 
 def cmd_check(args: argparse.Namespace) -> int:
     live = False
+    source = "inventory"
     if getattr(args, "inventory", None):
         installs = read_inventory(args.inventory)
     elif getattr(args, "ssh_hosts", None):
+        source = "ssh"
         installs = scan_ssh_hosts(args.ssh_hosts, args.ssh_jobs)
     elif args.version:
+        source = "version"
         v = parse_version(args.version)
         verdict = assess(v)
         install = PhpInstall(binary=f"(version string: {args.version})",
@@ -1781,6 +2031,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         installs = [i for b in find_php_binaries(args.php_binary)
                     if (i := inspect_binary(b)) is not None]
         live = True
+        source = "local"
 
     # Restart awareness only makes sense for the machine we are running on.
     stale: list = []
@@ -1819,7 +2070,12 @@ def cmd_check(args: argparse.Namespace) -> int:
         print_human(installs, use_color=sys.stdout.isatty() and not args.no_color,
                     stale=stale, stale_note=stale_note)
 
-    return check_exit_code(installs, args.fail_on, local_stale=bool(stale))
+    code = check_exit_code(installs, args.fail_on, local_stale=bool(stale))
+    err = write_reports(args, "PHP2Shell check", rows_from_installs(installs, source, stale))
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    return code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1849,6 +2105,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")
     c.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    add_report_args(c)
     c.add_argument("--no-restart-check", action="store_true",
                    help="skip the check for running PHP processes that still "
                         "execute code replaced on disk (Linux /proc)")
@@ -1889,6 +2146,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--running", action="store_true",
                    help="also probe running containers via `docker exec` (read-only)")
     d.add_argument("--json", action="store_true", help="machine-readable output")
+    add_report_args(d)
     add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
 

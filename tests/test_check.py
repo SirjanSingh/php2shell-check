@@ -56,6 +56,12 @@ from php2shell_check import (  # noqa: E402
     apply_backport,
     backport_notes,
     inspect_binary,
+    ReportRow,
+    rows_from_installs,
+    rows_from_hits,
+    render_markdown,
+    render_html,
+    DockerHit,
     classify_code_line,
     scan_code_file,
     iter_code_files,
@@ -1135,6 +1141,104 @@ class DockerProbeTests(unittest.TestCase):
         code, out, _ = self._cli(["scan-docker", "--image", "x"], ins)
         self.assertEqual(code, 0)
         self.assertIn("[OK (distro backport)]", out)
+
+
+class ReportTests(unittest.TestCase):
+    def _rows(self):
+        bad = PhpInstall('<script>alert(1)</script>"', "PHP 8.3.10", assess((8, 3, 10)))
+        ok = PhpInstall("/usr/bin/php", "PHP 8.4.27", assess((8, 4, 27)))
+        return rows_from_installs([bad, ok], "ssh")
+
+    def test_markdown_summary_and_rows(self):
+        md = render_markdown("PHP2Shell check", self._rows(), "2026-10-30T00:00:00Z")
+        self.assertIn("| Status | Target |", md)
+        self.assertIn("1 affected", md)
+        self.assertIn("1 patched", md)
+        self.assertNotIn("—", md)                     # no em dashes
+        self.assertLess(md.index("vulnerable"), md.index("| patched"))  # worst first
+
+    def test_reports_have_no_em_dashes_even_from_verdict_text(self):
+        rows = rows_from_installs([PhpInstall("php", "PHP 7.4.1", assess((7, 4, 1)))], "ssh")
+        self.assertIn("—", rows[0].detail)
+        self.assertNotIn("—", render_markdown("t", rows, "now"))
+        self.assertNotIn("—", render_html("t", rows, "now"))
+
+    def test_markdown_escapes_pipes(self):
+        r = ReportRow("a|b", "local", "8.3.10", "vulnerable", "x", [])
+        self.assertIn("a\\|b", render_markdown("t", [r], "now"))
+
+    def test_markdown_notes_in_details_and_escaped(self):
+        r = ReportRow("t", "local", "8.3.10", "vulnerable", "d", ["see <b>x</b> | y"])
+        md = render_markdown("t", [r], "now")
+        self.assertIn("<details>", md)
+        self.assertNotIn("<b>x", md)
+
+    def test_html_is_self_contained_and_escaped(self):
+        page = render_html("PHP2Shell check", self._rows(), "2026-10-30T00:00:00Z")
+        self.assertNotIn("<script>alert(1)", page)
+        self.assertIn("&lt;script&gt;", page)
+        self.assertNotIn("<script", page.lower())
+        self.assertNotRegex(page, r"(src|href)=\"https?://")
+        self.assertIn("prefers-color-scheme: dark", page)
+        self.assertIn("<title>PHP2Shell report</title>", page)
+        self.assertIn("data:image/svg+xml", page)
+
+    def test_rows_from_installs_stale(self):
+        ins = PhpInstall("/usr/sbin/php-fpm", "PHP 8.4.27", assess((8, 4, 27)),
+                         stale=[StaleProcess("php-fpm", [4], "binary replaced on disk (x)")])
+        rows = rows_from_installs([ins], "ssh")
+        self.assertEqual(rows[0].status, "restart_needed")
+        local = rows_from_installs([], "local",
+                                   [StaleProcess("php-fpm", [4], "binary replaced on disk (x)")])
+        self.assertEqual([r.status for r in local], ["restart_needed"])
+        self.assertEqual(local[0].source, "local")
+
+    def test_rows_from_hits(self):
+        ins = PhpInstall("image php:8.2.20: php", "PHP 8.2.20", assess((8, 2, 20)))
+        hits = [DockerHit("Dockerfile", 3, "php:8.3", assess_tag("8.3")),
+                DockerHit("image php:8.2.20", 0, "php:8.2.20", ins.verdict, install=ins)]
+        rows = rows_from_hits(hits)
+        self.assertEqual(rows[0].target, "Dockerfile:3 (php:8.3)")
+        self.assertEqual(rows[0].source, "dockerfile")
+        self.assertEqual(rows[1].source, "image")
+        self.assertEqual(rows[1].status, "vulnerable")
+        self.assertIn("image php:8.2.20: php", rows[1].target)
+
+    def test_cli_writes_reports_and_keeps_exit_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            md, ht = os.path.join(d, "r.md"), os.path.join(d, "r.html")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main(["check", "--version", "8.3.10", "--markdown", md, "--html", ht])
+            self.assertEqual(code, 1)
+            self.assertTrue(os.path.getsize(md) and os.path.getsize(ht))
+
+    def test_cli_reports_leave_json_stdout_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            md = os.path.join(d, "r.md")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(["check", "--version", "8.3.10", "--json", "--markdown", md])
+            self.assertEqual(json.loads(out.getvalue())["installs"][0]["version"], "8.3.10")
+
+    def test_scan_docker_writes_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            df, md = os.path.join(d, "Dockerfile"), os.path.join(d, "r.md")
+            with open(df, "w") as fh:
+                fh.write("FROM php:8.3.10\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = main(["scan-docker", df, "--markdown", md])
+            self.assertEqual(code, 1)
+            with open(md, encoding="utf-8") as fh:
+                self.assertIn("1 affected", fh.read())
+
+    def test_unwritable_report_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "missing", "r.md")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = main(["check", "--version", "8.4.27", "--markdown", bad])
+            self.assertEqual(code, 2)
+            self.assertIn("r.md", err.getvalue())
 
 
 if __name__ == "__main__":
