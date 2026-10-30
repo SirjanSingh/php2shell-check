@@ -1425,14 +1425,28 @@ class GithubActionTests(unittest.TestCase):
             "P2S_COMMAND": "${{ inputs.command }}",
             "P2S_ARGS": "${{ inputs.args }}",
             "P2S_FAIL_ON": "${{ inputs.fail-on }}",
+            "P2S_PYTHON": "${{ steps.python.outputs.python-path }}",
         })
+
+    def test_setup_python_leaves_the_callers_python_alone(self):
+        # Without update-environment: false, setup-python puts its Python first
+        # on PATH for every later step of the caller's job.
+        setup = next(s for s in self.action["runs"]["steps"]
+                     if str(s.get("uses", "")).startswith("actions/setup-python@"))
+        self.assertEqual(setup["id"], "python")
+        self.assertIs(setup["with"]["update-environment"], False)
+        self.assertEqual(setup["with"]["python-version"], "${{ inputs.python-version }}")
 
     def run_script(self, d, command, args="", fail_on=""):
         """Run the step's script as the runner does (bash -eo pipefail), with
-        `python` pointing at this interpreter and the GITHUB_* files in `d`."""
+        P2S_PYTHON set to this interpreter (setup-python's python-path output)
+        and the GITHUB_* files in `d`. A `python` on PATH that always fails
+        proves the script runs the interpreter it was given."""
         bindir = os.path.join(d, "bin")
         os.makedirs(bindir)
-        os.symlink(sys.executable, os.path.join(bindir, "python"))
+        with open(os.path.join(bindir, "python"), "w") as fh:
+            fh.write("#!/bin/sh\necho 'wrong python' >&2\nexit 99\n")
+        os.chmod(os.path.join(bindir, "python"), 0o755)
         runner_temp = os.path.join(d, "runner-temp")
         os.makedirs(runner_temp)
         script = os.path.join(d, "step.sh")
@@ -1442,7 +1456,8 @@ class GithubActionTests(unittest.TestCase):
                    GITHUB_ACTION_PATH=self.REPO, RUNNER_TEMP=runner_temp,
                    GITHUB_STEP_SUMMARY=os.path.join(d, "summary.md"),
                    GITHUB_OUTPUT=os.path.join(d, "output.txt"),
-                   P2S_COMMAND=command, P2S_ARGS=args, P2S_FAIL_ON=fail_on)
+                   P2S_COMMAND=command, P2S_ARGS=args, P2S_FAIL_ON=fail_on,
+                   P2S_PYTHON=sys.executable)
         proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script],
                               cwd=d, env=env, capture_output=True, text=True, timeout=120)
 

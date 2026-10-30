@@ -27,15 +27,20 @@ outputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-python@v5
+    # update-environment: false keeps this Python off the caller's PATH for the
+    # rest of their job; the scan step runs it by path instead.
+    - id: python
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python-version }}
+        update-environment: false
     - id: scan
       shell: bash
       env:
         P2S_COMMAND: ${{ inputs.command }}
         P2S_ARGS: ${{ inputs.args }}
         P2S_FAIL_ON: ${{ inputs.fail-on }}
+        P2S_PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
         set +e
         case "$P2S_COMMAND" in
@@ -47,7 +52,7 @@ runs:
         case "$P2S_COMMAND" in
           check|scan-docker) md="$RUNNER_TEMP/php2shell.md" ;;
         esac
-        python "$GITHUB_ACTION_PATH/php2shell_check.py" "$P2S_COMMAND" $P2S_ARGS \
+        "$P2S_PYTHON" "$GITHUB_ACTION_PATH/php2shell_check.py" "$P2S_COMMAND" $P2S_ARGS \
           ${P2S_FAIL_ON:+--fail-on "$P2S_FAIL_ON"} ${md:+--markdown "$md"}
         code=$?
         if [ -n "$md" ] && [ -s "$md" ]; then
