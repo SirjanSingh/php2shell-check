@@ -119,7 +119,7 @@ RHEL-family `8.0.30-8.el9_8.1` or a Debian `8.2.20-1+deb11u9` can be patched
 while the version number says otherwise. When a version looks affected, `check`
 asks the package manager (`dpkg` or `rpm`) which package owns the php binary and
 reads that package's changelog. The install is reported as
-`OK (distro backport)` only if the changelog names **both** CVE-2026-109618 and
+`OK, patched (distro backport)` (`OK (distro backport)` in `scan-docker`) only if the changelog names **both** CVE-2026-109618 and
 CVE-2026-109619.
 
 Anything less leaves the version verdict alone and adds a note saying why: only
@@ -222,8 +222,8 @@ falls back to `php -v`. With `--running`, your running containers get the same
 probe through `docker exec`, including the restart check. A probe that fails is
 reported as `UNKNOWN` with the reason, not skipped.
 
-Without `--image`, it reads PHP base-image tags. A pinned tag (`php:8.3.10`) is judged exactly; a
-floating branch tag (`php:8.4`) is flagged as ambiguous (pin a patched tag),
+Without `--image`, it reads PHP base-image tags. A pinned tag (`php:8.3.10`) is
+judged exactly; a floating branch tag (`php:8.4`) is flagged as ambiguous (pin a patched tag),
 and an end-of-life branch tag (`php:8.1`) is flagged affected outright.
 
 ### Check a whole fleet (offline)
@@ -343,7 +343,10 @@ follows the viewer's light or dark scheme and fits a phone screen. `--markdown`
 renders in a GitHub job summary. Rows are sorted worst first, with notes
 (backport evidence, config posture, restart needed) folded under each one.
 
-![HTML report with affected, end-of-life, unknown, backport-patched and patched rows](docs/report.png)
+![Sample HTML report built from example data: affected, end-of-life, unknown, backport-patched and patched rows](docs/report.png)
+
+*A sample report rendered from example data, including one backported host. It
+is not the output of a real scan.*
 
 ### GitHub Action: gate CI on PHP2Shell
 
@@ -383,6 +386,12 @@ holds the exit code. To upload SARIF to the **Security** tab, install the tool
 and call it directly:
 
 ```yaml
+name: php2shell-sarif
+on: [push, pull_request]
+
+jobs:
+  sarif:
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write   # for the SARIF upload
