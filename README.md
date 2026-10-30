@@ -114,17 +114,21 @@ on non-Linux systems, and it only sees processes in the PID namespace it runs in
 
 ### Distro backports
 
-Distros often fix a CVE without moving to the upstream fixed version, so a
-RHEL-family `8.0.30-8.el9_8.1` or a Debian `8.2.20-1+deb11u9` can be patched
-while the version number says otherwise. When a version looks affected, `check`
-asks the package manager (`dpkg` or `rpm`) which package owns the php binary and
-reads that package's changelog. The install is reported as
-`OK, patched (distro backport)` (`OK (distro backport)` in `scan-docker`) only if the changelog names **both** CVE-2026-109618 and
-CVE-2026-109619.
+Some vendors fix a CVE without moving to the upstream fixed version, so a RHEL
+`8.0.30-8.el9_8.1`, an AlmaLinux `.alma.1` rebuild or a Remi build of an
+end-of-life branch can be patched while the version number says otherwise.
+Debian and Ubuntu security updates for these CVEs move to the fixed upstream
+version (for example 8.2.35 or 8.4.27), so the version check already covers them.
+When a version looks affected, `check` asks the package manager (`dpkg` or `rpm`)
+which package owns the php binary and reads that package's changelog. The install
+is reported as `OK, patched (distro backport)` (`OK (distro backport)` in
+`scan-docker`) only if the package's upstream version is the version PHP itself
+reports and the changelog names **both** CVE-2026-109618 and CVE-2026-109619.
 
 Anything less leaves the version verdict alone and adds a note saying why: only
-one CVE named, or the changelog could not be read. Missing evidence never
-downgrades a result. The same check runs over `--ssh-hosts`. Where there is no
+one CVE named, the changelog could not be read, or the package is a different
+version from the PHP that runs (a source build or a copied binary over a packaged
+path). Missing evidence never downgrades a result. The same check runs over `--ssh-hosts`. Where there is no
 `dpkg` or `rpm` (a source build, a container image without a package database),
 the version verdict stands. Confirm against your vendor's advisory.
 
@@ -220,7 +224,9 @@ with `--network none`, `--cap-drop ALL` and `--security-opt no-new-privileges`,
 and `docker` pulls the image if it is missing. An image with no `sh` (distroless)
 falls back to `php -v`. With `--running`, your running containers get the same
 probe through `docker exec`, including the restart check. A probe that fails is
-reported as `UNKNOWN` with the reason, not skipped.
+reported as `UNKNOWN` with the reason, not skipped. Without `--fail-on`, when
+nothing is affected and every `--image` probe is `UNKNOWN`, `scan-docker` exits
+`2` (could not determine), as `check` does when it finds no PHP.
 
 Without `--image`, it reads PHP base-image tags. A pinned tag (`php:8.3.10`) is
 judged exactly; a floating branch tag (`php:8.4`) is flagged as ambiguous (pin a patched tag),
@@ -420,7 +426,7 @@ Use `--fail-on none` on any step to report without failing the build.
 | WAF/IDS rules | yes | no | no |
 | SSH fleet | yes | no | no |
 | CVE-2026-115560 | yes | no | no |
-| Image and container probes | yes | no | no |
+| Image and container probes | yes | varies | varies |
 | Reports (HTML, Markdown) | yes | varies | varies |
 | GitHub Action | yes | varies | varies |
 | Probe traffic sent | none | yes | none |

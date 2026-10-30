@@ -41,6 +41,8 @@ Exit codes (check):
     0  not affected (patched, or a branch with no known issue)
     1  affected, or PHP processes still running code replaced on disk
     2  could not determine (no PHP found / unparseable version)
+Exit codes (scan-docker): the same 0 and 1; 2 when nothing is affected and
+every --image probe is UNKNOWN (or a report file cannot be written).
 --fail-on high|medium|low|none changes this to "1 only at or above that level".
 """
 
@@ -220,10 +222,12 @@ def _run_ok(cmd: list[str]) -> Optional[str]:
 
 # --- distro backports --------------------------------------------------------
 #
-# Distros often fix a CVE without moving to the upstream fixed version (RHEL
-# 8.0.30-8.el9_8.1, Debian 8.2.20-1+deb11u9), so the version string alone
-# over-reports. An affected version counts as patched only when the changelog
-# of the package that owns the binary names BOTH CVE IDs.
+# Some vendors fix a CVE without moving to the upstream fixed version (RHEL
+# 8.0.30-8.el9_8.1, AlmaLinux .alma.1 rebuilds, Remi builds of EOL branches), so
+# the version string alone over-reports. Debian and Ubuntu security updates move
+# to the fixed upstream version, which the version check already covers. An
+# affected version counts as patched only when the package that owns the binary
+# is that same upstream version and its changelog names BOTH CVE IDs.
 
 _PKG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]*")
 
