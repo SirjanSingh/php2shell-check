@@ -28,9 +28,11 @@ Usage:
     php2shell-check check [--php-binary PATH] [--version X.Y.Z] [--json]
                           [--inventory FILE | --ssh-hosts FILE [--ssh-jobs N]]
                           [--no-restart-check] [--fail-on LEVEL]
+                          [--markdown FILE] [--html FILE]
     php2shell-check harden [--apply] [--conf-dir DIR] [--php-binary PATH]
     php2shell-check scan-logs LOGFILE [...] [--fail-on LEVEL]
-    php2shell-check scan-docker [PATH ...] [--running] [--fail-on LEVEL]
+    php2shell-check scan-docker [PATH ...] [--image IMAGE ...] [--running]
+                                [--fail-on LEVEL] [--markdown FILE] [--html FILE]
     php2shell-check scan-code PATH [...] [--json] [--fail-on LEVEL]
     php2shell-check rules [--format modsecurity|sigma|suricata|all]
                           [--output DIR] [--block]
@@ -59,7 +61,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # --- Vulnerability data -----------------------------------------------------
 

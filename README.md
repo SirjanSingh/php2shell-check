@@ -29,6 +29,7 @@ October 21 patches do not fix.
 curl -sO https://raw.githubusercontent.com/SirjanSingh/php2shell-check/main/php2shell_check.py
 python3 php2shell_check.py check      # Am I affected?
 python3 php2shell_check.py harden     # If so, exact fix for my OS
+python3 php2shell_check.py check --html report.html   # A report to hand to someone
 # Then update PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 and re-check.
 ```
 
@@ -111,6 +112,22 @@ Run it as root to see every worker; processes it can't inspect are reported, not
 skipped silently. Skip the check with `--no-restart-check`. It is not available
 on non-Linux systems, and it only sees processes in the PID namespace it runs in.
 
+### Distro backports
+
+Distros often fix a CVE without moving to the upstream fixed version, so a
+RHEL-family `8.0.30-8.el9_8.1` or a Debian `8.2.20-1+deb11u9` can be patched
+while the version number says otherwise. When a version looks affected, `check`
+asks the package manager (`dpkg` or `rpm`) which package owns the php binary and
+reads that package's changelog. The install is reported as
+`OK (distro backport)` only if the changelog names **both** CVE-2026-109618 and
+CVE-2026-109619.
+
+Anything less leaves the version verdict alone and adds a note saying why: only
+one CVE named, or the changelog could not be read. Missing evidence never
+downgrades a result. The same check runs over `--ssh-hosts`. Where there is no
+`dpkg` or `rpm` (a source build, a container image without a package database),
+the version verdict stands. Confirm against your vendor's advisory.
+
 ### Check a version string (no live PHP needed, great for CI / inventory)
 
 ```bash
@@ -192,7 +209,20 @@ published by security vendors after disclosure:
 ./php2shell_check.py scan-docker --running             # + your running containers
 ```
 
-Reads PHP base-image tags. A pinned tag (`php:8.3.10`) is judged exactly; a
+```bash
+./php2shell_check.py scan-docker --image php:8.3.10-fpm --image myapp:latest
+```
+
+`--image` starts a throwaway container from the image and runs the same
+read-only probe used for SSH hosts: `php -v`, a few ini values, and the package
+and changelog check above. It looks at the CLI and at FPM. The container runs
+with `--network none`, `--cap-drop ALL` and `--security-opt no-new-privileges`,
+and `docker` pulls the image if it is missing. An image with no `sh` (distroless)
+falls back to `php -v`. With `--running`, your running containers get the same
+probe through `docker exec`, including the restart check. A probe that fails is
+reported as `UNKNOWN` with the reason, not skipped.
+
+Without `--image`, it reads PHP base-image tags. A pinned tag (`php:8.3.10`) is judged exactly; a
 floating branch tag (`php:8.4`) is flagged as ambiguous (pin a patched tag),
 and an end-of-life branch tag (`php:8.1`) is flagged affected outright.
 
@@ -298,11 +328,29 @@ also flag (or block) at the edge:
 Upload it so findings land in your repo's **Security** tab. `scan-docker` has no
 SARIF output; gate it with `--fail-on` as below.
 
+### Reports
+
+`check` and `scan-docker` can write the findings to a file as well as the
+normal output:
+
+```bash
+./php2shell_check.py check --inventory hosts.txt --html report.html
+./php2shell_check.py scan-docker --image myapp:latest --markdown report.md
+```
+
+`--html` is one self-contained file with no scripts or external requests; it
+follows the viewer's light or dark scheme and fits a phone screen. `--markdown`
+renders in a GitHub job summary. Rows are sorted worst first, with notes
+(backport evidence, config posture, restart needed) folded under each one.
+
+![HTML report with affected, end-of-life, unknown, backport-patched and patched rows](docs/report.png)
+
 ### GitHub Action: gate CI on PHP2Shell
 
-Copy this into `.github/workflows/php2shell.yml`. It fails the build on affected
-base images (and, with `--fail-on medium`, on unpinned `php:8.x` tags), and
-uploads host and log findings to the **Security** tab:
+The repo ships a composite action. The `v1` tag is created at the v0.3.0
+release; until it exists, pin to a commit SHA. It fails the build on affected
+base images (and, with `fail-on: medium`, on unpinned `php:8.x` tags) and writes
+a Markdown report to the job summary:
 
 ```yaml
 name: php2shell
@@ -311,6 +359,30 @@ on: [push, pull_request]
 jobs:
   php2shell:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail on affected, or unpinned, PHP base images in Dockerfiles/compose files.
+      - uses: SirjanSingh/php2shell-check@v1
+        with:
+          command: scan-docker
+          fail-on: medium
+
+      # Pin the version your build ships and fail if it is affected.
+      - uses: SirjanSingh/php2shell-check@v1
+        with:
+          command: check
+          args: --version 8.4.27
+          fail-on: high
+```
+
+Inputs: `command` (`check`, `scan-docker`, `scan-logs` or `scan-code`, default
+`scan-docker`), `args` (everything after the command), `fail-on` (empty keeps the
+usual exit codes) and `python-version` (default 3.13). The `exit-code` output
+holds the exit code. To upload SARIF to the **Security** tab, install the tool
+and call it directly:
+
+```yaml
     permissions:
       contents: read
       security-events: write   # for the SARIF upload
@@ -319,12 +391,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install "php2shell-check>=0.2.0"
-
-      # Fail on affected, or unpinned, PHP base images in Dockerfiles/compose files.
-      - run: php2shell-check scan-docker --fail-on medium
-
-      # Pin the version your build ships and fail if it is affected.
+      - run: pip install php2shell-check
       - run: php2shell-check check --version 8.4.27 --sarif > results.sarif
       - uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -333,6 +400,23 @@ jobs:
 ```
 
 Use `--fail-on none` on any step to report without failing the build.
+
+## How it compares
+
+| | This tool | Active remote scanners | Version checkers |
+|---|---|---|---|
+| Backport-aware verdicts | yes, from the package changelog | no | no |
+| Restart check | yes | no | no |
+| Log scanning | yes | no | no |
+| WAF/IDS rules | yes | no | no |
+| SSH fleet | yes | no | no |
+| CVE-2026-115560 | yes | no | no |
+| Image and container probes | yes | no | no |
+| Reports (HTML, Markdown) | yes | varies | varies |
+| GitHub Action | yes | varies | varies |
+| Probe traffic sent | none | yes | none |
+
+"No" and "varies" describe the general kind of tool, not any one project.
 
 ## Why there's no remote "URL scan" mode
 
