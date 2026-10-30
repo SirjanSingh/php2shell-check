@@ -698,17 +698,21 @@ class SshFleetTests(unittest.TestCase):
         self.assertNotIn("@CVE_RE@", script)
         self.assertNotIn("@DOC@", script)
 
-    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
-    def test_probe_script_reads_fake_dpkg_changelog(self):
+    # The only system tools on the probe's PATH, beside the fakes, so the
+    # host's own dpkg or rpm never answers for the fake php.
+    PROBE_TOOLS = ("sh", "head", "sed", "grep", "cut", "sort", "awk", "readlink", "cat", "gzip")
+
+    def _run_fake_probe(self, changelog, manager="dpkg", tools=PROBE_TOOLS, fakes=None):
+        """Run the real sh probe against a fake php 8.2.20 and a fake dpkg or
+        rpm whose package changelog is `changelog`. `fakes` adds more shims
+        ({name: sh body}). Returns the probe's stdout."""
         with tempfile.TemporaryDirectory() as tmp:
-            bindir = os.path.join(tmp, "bin")
-            os.makedirs(bindir)
-            os.makedirs(os.path.join(tmp, "proc"))
-            docdir = os.path.join(tmp, "doc", "php8.2-common")
-            os.makedirs(docdir)
-            with gzip.open(os.path.join(docdir, "changelog.Debian.gz"), "wt") as fh:
-                fh.write("php8.2 (8.2.20-1+deb12u1) bookworm-security; urgency=high\n"
-                         "  * Fix CVE-2026-109618 and CVE-2026-109619\n")
+            bindir, sysdir = os.path.join(tmp, "bin"), os.path.join(tmp, "sys")
+            for d in (bindir, sysdir, os.path.join(tmp, "proc")):
+                os.makedirs(d)
+            for t in tools:
+                if shutil.which(t):
+                    os.symlink(shutil.which(t), os.path.join(sysdir, t))
 
             def script(name, body):
                 path = os.path.join(bindir, name)
@@ -717,19 +721,80 @@ class SshFleetTests(unittest.TestCase):
                 os.chmod(path, 0o755)
 
             script("php", 'case "$1" in -v) echo "PHP 8.2.20 (cli)" ;; esac\n')
-            script("dpkg", 'echo "php8.2-cli: $2"\n')
-            script("dpkg-query", 'printf %s "8.2.20-1+deb12u1"\n')
-            env = dict(os.environ, PATH=bindir + os.pathsep + "/usr/bin:/bin")
+            if manager == "dpkg":
+                docdir = os.path.join(tmp, "doc", "php8.2-common")
+                os.makedirs(docdir)
+                with gzip.open(os.path.join(docdir, "changelog.Debian.gz"), "wt") as fh:
+                    fh.write(changelog)
+                script("dpkg", 'echo "php8.2-cli: $2"\n')
+                script("dpkg-query", 'printf %s "8.2.20-1"\n')
+            else:
+                with open(os.path.join(tmp, "rpm-changelog"), "w") as fh:
+                    fh.write(changelog)
+                script("rpm", 'case "$1" in\n'
+                              '  -qf) printf %s "php-cli 8.2.20-8.el9_8.1" ;;\n'
+                              '  -q) [ "$2" = --changelog ] && [ "$3" = php-cli ] && '
+                              f'cat "{tmp}/rpm-changelog" ;;\n'
+                              'esac\n')
+            for name, body in (fakes or {}).items():
+                script(name, body)
             out = subprocess.run(
-                ["sh", "-s"],
+                [shutil.which("sh"), "-s"],
                 input=build_remote_probe(os.path.join(tmp, "proc"), os.path.join(tmp, "doc")),
-                capture_output=True, text=True, env=env, timeout=30)
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PATH=bindir + os.pathsep + sysdir))
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("PKG dpkg php8.2-cli 8.2.20-1+deb12u1", out.stdout)
-        self.assertIn("CVE CVE-2026-109618", out.stdout)
-        self.assertIn("CVE CVE-2026-109619", out.stdout)
-        (ins,) = parse_remote_probe("h", out.stdout)
+        return out.stdout
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
+    def test_probe_script_reads_fake_dpkg_changelog(self):
+        out = self._run_fake_probe("php8.2 (8.2.20-1) unstable; urgency=high\n"
+                                   "  * Fix CVE-2026-109618 and CVE-2026-109619.\n")
+        self.assertIn("PKG dpkg php8.2-cli 8.2.20-1\n", out)
+        self.assertIn("CVE CVE-2026-109618\n", out)
+        self.assertIn("CVE CVE-2026-109619\n", out)
+        (ins,) = parse_remote_probe("h", out)
         self.assertEqual(ins.verdict.status, STATUS_PATCHED_BACKPORT)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
+    def test_probe_script_reads_fake_rpm_changelog(self):
+        out = self._run_fake_probe("* Mon Oct 26 2026 Packager <p@example.org> - 8.2.20-8.el9_8.1\n"
+                                   "- Fix CVE-2026-109618\n- Fix CVE-2026-109619\n", manager="rpm")
+        self.assertIn("PKG rpm php-cli 8.2.20-8.el9_8.1\n", out)
+        self.assertIn("CVE CVE-2026-109618\n", out)
+        self.assertIn("CVE CVE-2026-109619\n", out)
+        (ins,) = parse_remote_probe("h", out)
+        self.assertEqual(ins.verdict.status, STATUS_PATCHED_BACKPORT)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
+    def test_probe_script_needs_a_digit_boundary_after_the_cve(self):
+        # Longer IDs that merely start with ours are other CVEs.
+        lookalike = "  * Fix CVE-2026-1096185 and CVE-2026-1096190\n"
+        for manager in ("dpkg", "rpm"):
+            with self.subTest(manager=manager):
+                out = self._run_fake_probe(lookalike, manager=manager)
+                self.assertNotIn("CVE CVE-", out)
+                self.assertNotIn("NOCHANGELOG", out)
+                (ins,) = parse_remote_probe("h", out)
+                self.assertTrue(ins.verdict.affected)
+                self.assertEqual(ins.package.cves, [])
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "needs POSIX sh")
+    def test_probe_script_without_gzip_or_grep_o_says_nochangelog(self):
+        # Without these the changelog cannot be searched; that must not read as
+        # "the changelog names neither CVE".
+        both = "  * Fix CVE-2026-109618 and CVE-2026-109619\n"
+        no_grep_o = {"grep": f'case "$1" in -o*) echo "grep: invalid option" >&2; exit 2 ;; esac\n'
+                             f'exec {shutil.which("grep")} "$@"\n'}
+        for label, kw in [("no gzip", {"tools": [t for t in self.PROBE_TOOLS if t != "gzip"]}),
+                          ("dpkg, no grep -o", {"fakes": no_grep_o}),
+                          ("rpm, no grep -o", {"fakes": no_grep_o, "manager": "rpm"})]:
+            with self.subTest(label):
+                out = self._run_fake_probe(both, **kw)
+                self.assertIn("NOCHANGELOG", out)
+                (ins,) = parse_remote_probe("h", out)
+                self.assertTrue(ins.verdict.affected)
+                self.assertTrue(any("changelog not available" in n for n in backport_notes(ins)))
 
 
 class FailOnTests(unittest.TestCase):
@@ -873,6 +938,15 @@ class BackportTests(unittest.TestCase):
                          ["CVE-2026-109618", "CVE-2026-109619"])
         self.assertEqual(changelog_cves("nothing here"), [])
 
+    def test_changelog_cves_needs_a_digit_boundary(self):
+        lookalike = "  * Fix CVE-2026-1096185 and CVE-2026-1096190\n"
+        self.assertEqual(changelog_cves(lookalike), [])
+        self.assertEqual(changelog_cves("(CVE-2026-109618, CVE-2026-109619)"), CVES)
+        self.assertEqual(changelog_cves("CVE-2026-109618CVE-2026-109619"), CVES)
+        ins = self._ins("8.2.20", changelog_cves(lookalike))
+        apply_backport(ins)
+        self.assertTrue(ins.verdict.affected)
+
     def test_both_cves_backported_is_patched(self):
         ins = self._ins("8.0.30", ["CVE-2026-109618", "CVE-2026-109619"])
         apply_backport(ins)
@@ -931,6 +1005,32 @@ class BackportTests(unittest.TestCase):
              mock.patch("php2shell_check.subprocess.run", side_effect=fake_rpm):
             pkg = package_for_binary("/usr/bin/php")
         self.assertEqual((pkg.manager, pkg.name, pkg.version), ("rpm", "php-cli", "8.0.30-8.el9_8.1"))
+
+    def test_empty_changelog_is_not_available(self):
+        # An empty answer cannot show the CVEs are missing, only that there is nothing to read.
+        for out in ("", "\n"):
+            with self.subTest(out=out), mock.patch("php2shell_check._run_ok", return_value=out):
+                self.assertIsNone(read_package_changelog(PackageInfo("rpm", "php-cli", "x", None)))
+        with mock.patch("php2shell_check._run_ok", return_value="- Fix CVE-2026-109618\n"):
+            self.assertIn("CVE-2026-109618",
+                          read_package_changelog(PackageInfo("rpm", "php-cli", "x", None)))
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "php8.2-cli"))
+            with gzip.open(os.path.join(root, "php8.2-cli", "changelog.Debian.gz"), "wt") as fh:
+                fh.write("")
+            self.assertIsNone(read_package_changelog(PackageInfo("dpkg", "php8.2-cli", "x", None),
+                                                     doc_root=root))
+        ins = self._inspect_rpm("")
+        self.assertIsNone(ins.package.cves)
+        self.assertTrue(any("changelog not available" in n for n in backport_notes(ins)))
+
+    def _inspect_rpm(self, rpm_changelog):
+        with mock.patch("php2shell_check._run", return_value="PHP 8.0.30 (cli)\n"), \
+             mock.patch("php2shell_check.package_for_binary",
+                        return_value=PackageInfo("rpm", "php-cli", "8.0.30-8.el9_8.1", None)), \
+             mock.patch("php2shell_check._run_ok", return_value=rpm_changelog), \
+             mock.patch("php2shell_check.read_ini_posture", return_value={}):
+            return inspect_binary("/usr/bin/php")
 
     def test_package_for_binary_unowned(self):
         with mock.patch("php2shell_check.shutil.which", return_value=None):

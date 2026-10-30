@@ -229,8 +229,9 @@ _PKG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]*")
 
 
 def changelog_cves(text: str) -> list:
-    """The members of CVES that appear in `text`, sorted."""
-    return sorted(c for c in CVES if c in text)
+    """The members of CVES that appear in `text`, sorted. An ID followed by
+    another digit is a different CVE (CVE-2026-1096185), so it does not count."""
+    return sorted(c for c in CVES if re.search(re.escape(c) + r"(?![0-9])", text))
 
 
 def package_for_binary(binary: str) -> Optional[PackageInfo]:
@@ -253,10 +254,12 @@ def package_for_binary(binary: str) -> Optional[PackageInfo]:
 
 
 def read_package_changelog(pkg: PackageInfo, doc_root: str = "/usr/share/doc") -> Optional[str]:
-    """The package's changelog text, or None if nothing is readable.
-    `doc_root` is injectable for tests."""
+    """The package's changelog text, or None if nothing is readable. An empty
+    changelog is None too: it proves nothing about the CVEs (the sh probe
+    says NOCHANGELOG for it). `doc_root` is injectable for tests."""
     if pkg.manager == "rpm":
-        return _run_ok(["rpm", "-q", "--changelog", pkg.name])
+        text = _run_ok(["rpm", "-q", "--changelog", pkg.name])
+        return text if text and text.strip() else None
     # php8.2-cli ships no changelog of its own; php8.2-common carries it.
     names = [pkg.name]
     common = re.sub(r"-[a-z]+$", "-common", pkg.name)
@@ -266,7 +269,8 @@ def read_package_changelog(pkg: PackageInfo, doc_root: str = "/usr/share/doc") -
         try:
             with gzip.open(os.path.join(doc_root, name, "changelog.Debian.gz"), "rt",
                            encoding="utf-8", errors="replace") as fh:
-                return fh.read()
+                text = fh.read()
+            return text if text.strip() else None
         except (OSError, EOFError, zlib.error):
             continue
     return None
@@ -1536,6 +1540,15 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
 # nothing, opens no ports and sends no exploit traffic.
 
 _REMOTE_PROBE_TEMPLATE = r"""PROC=@PROC@
+# One "CVE <id>" line per ID in changelog text $1. An ID needs a non-digit
+# after it (CVE-2026-1096185 is not ours). Empty text, or a grep with no -o,
+# is NOCHANGELOG rather than "names neither".
+cve_lines() {
+  [ -n "$1" ] || { echo NOCHANGELOG; return; }
+  m=$(printf '%s\n' "$1" | grep -oE '(@CVE_RE@)([^0-9]|$)' 2>/dev/null)
+  [ $? -le 1 ] || { echo NOCHANGELOG; return; }
+  [ -z "$m" ] || printf '%s\n' "$m" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | sed 's/^/CVE /'
+}
 seen=" "
 for name in @NAMES@; do
   p=$(command -v "$name" 2>/dev/null) || continue
@@ -1551,11 +1564,12 @@ for name in @NAMES@; do
     for d in "$pkg" "$(echo "$pkg" | sed 's/-[a-z]*$/-common/')"; do
       [ -r "@DOC@/$d/changelog.Debian.gz" ] && { cl="@DOC@/$d/changelog.Debian.gz"; break; }
     done
-    if [ -n "$cl" ]; then gzip -dc "$cl" 2>/dev/null | grep -oE '@CVE_RE@' | sort -u | sed 's/^/CVE /'; else echo NOCHANGELOG; fi
+    txt=""
+    [ -z "$cl" ] || txt=$(gzip -dc "$cl" 2>/dev/null)
+    cve_lines "$txt"
   elif command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf --qf '%{NAME} %{VERSION}-%{RELEASE}' "$real" 2>/dev/null); then
     echo "PKG rpm $pkg"
-    cl=$(rpm -q --changelog "${pkg%% *}" 2>/dev/null)
-    if [ -n "$cl" ]; then printf '%s\n' "$cl" | grep -oE '@CVE_RE@' | sort -u | sed 's/^/CVE /'; else echo NOCHANGELOG; fi
+    cve_lines "$(rpm -q --changelog "${pkg%% *}" 2>/dev/null)"
   fi
 done
 for d in "$PROC"/[0-9]*; do
