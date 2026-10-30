@@ -45,6 +45,7 @@ Exit codes (check):
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -52,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zlib
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -108,6 +110,8 @@ STATUS_PATCHED = "patched"
 STATUS_VULNERABLE = "vulnerable"
 STATUS_VULNERABLE_EOL = "vulnerable_eol"
 STATUS_UNKNOWN = "unknown"
+# A version-affected build whose distro changelog names both CVEs.
+STATUS_PATCHED_BACKPORT = "patched_backport"
 
 
 @dataclass
@@ -175,6 +179,14 @@ def assess(version: Optional[tuple[int, int, int]]) -> Verdict:
 # --- PHP discovery ----------------------------------------------------------
 
 @dataclass
+class PackageInfo:
+    manager: str  # "dpkg" | "rpm"
+    name: str
+    version: str
+    cves: Optional[list]  # IDs from CVES found in the changelog, sorted; None = changelog not available
+
+
+@dataclass
 class PhpInstall:
     binary: str
     raw_version: str
@@ -182,6 +194,7 @@ class PhpInstall:
     upload_progress_enabled: Optional[bool] = None
     config: dict = field(default_factory=dict)
     stale: list = field(default_factory=list)
+    package: Optional[PackageInfo] = None
 
 
 def _run(cmd: list[str]) -> Optional[str]:
@@ -190,6 +203,98 @@ def _run(cmd: list[str]) -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
     return (out.stdout or "") + (out.stderr or "")
+
+
+def _run_ok(cmd: list[str]) -> Optional[str]:
+    """stdout of a command that exited 0, else None (also when it is not installed)."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# --- distro backports --------------------------------------------------------
+#
+# Distros often fix a CVE without moving to the upstream fixed version (RHEL
+# 8.0.30-8.el9_8.1, Debian 8.2.20-1+deb11u9), so the version string alone
+# over-reports. An affected version counts as patched only when the changelog
+# of the package that owns the binary names BOTH CVE IDs.
+
+_PKG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]*")
+
+
+def changelog_cves(text: str) -> list:
+    """The members of CVES that appear in `text`, sorted."""
+    return sorted(c for c in CVES if c in text)
+
+
+def package_for_binary(binary: str) -> Optional[PackageInfo]:
+    """The dpkg or rpm package that owns `binary`, or None when neither tool
+    is installed or neither owns the file."""
+    path = os.path.realpath(binary)
+    if shutil.which("dpkg"):
+        owner = _run_ok(["dpkg", "-S", path])
+        if owner and owner.strip():
+            name = owner.splitlines()[0].split(":")[0].split(",")[0].strip()
+            version = _run_ok(["dpkg-query", "-W", "-f=${Version}", name]) if shutil.which("dpkg-query") else None
+            if version and version.strip() and _PKG_NAME_RE.fullmatch(name):
+                return PackageInfo("dpkg", name, _clean(version.strip()), None)
+    if shutil.which("rpm"):
+        owner = _run_ok(["rpm", "-qf", "--qf", "%{NAME} %{VERSION}-%{RELEASE}", path])
+        parts = owner.split() if owner else []
+        if len(parts) == 2 and _PKG_NAME_RE.fullmatch(parts[0]):
+            return PackageInfo("rpm", parts[0], _clean(parts[1]), None)
+    return None
+
+
+def read_package_changelog(pkg: PackageInfo, doc_root: str = "/usr/share/doc") -> Optional[str]:
+    """The package's changelog text, or None if nothing is readable.
+    `doc_root` is injectable for tests."""
+    if pkg.manager == "rpm":
+        return _run_ok(["rpm", "-q", "--changelog", pkg.name])
+    # php8.2-cli ships no changelog of its own; php8.2-common carries it.
+    names = [pkg.name]
+    common = re.sub(r"-[a-z]+$", "-common", pkg.name)
+    if common not in names:
+        names.append(common)
+    for name in names:
+        try:
+            with gzip.open(os.path.join(doc_root, name, "changelog.Debian.gz"), "rt",
+                           encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except (OSError, EOFError, zlib.error):
+            continue
+    return None
+
+
+def apply_backport(ins: PhpInstall) -> None:
+    """Upgrade an affected verdict to patched_backport when the owning
+    package's changelog names every CVE in CVES."""
+    pkg = ins.package
+    if not (ins.verdict.affected and pkg and pkg.cves is not None
+            and all(c in pkg.cves for c in CVES)):
+        return
+    old = ins.verdict
+    ins.verdict = Verdict(
+        old.version, STATUS_PATCHED_BACKPORT,
+        f"PHP {old.version_str} with a distro backport: {pkg.manager} package "
+        f"{_clean(pkg.name)} {_clean(pkg.version)} changelog names {', '.join(CVES)}.",
+        fixed_version=old.fixed_version)
+
+
+def backport_notes(ins: PhpInstall) -> list[str]:
+    """Why an affected install with a known package was not treated as patched."""
+    pkg = ins.package
+    if not pkg or not ins.verdict.affected:
+        return []
+    who = f"package {_clean(pkg.name)} {_clean(pkg.version)}"
+    if pkg.cves is None:
+        return [f"{who}: changelog not available, cannot confirm a distro backport; "
+                f"check your vendor advisory"]
+    found = ", ".join(pkg.cves) or "neither CVE"
+    missing = ", ".join(c for c in CVES if c not in pkg.cves)
+    return [f"{who}: changelog names {found}, missing {missing}; not treated as patched"]
 
 
 PHP_CANDIDATES = ("php", "php-fpm", "php8.5", "php8.4", "php8.3", "php8.2",
@@ -249,6 +354,11 @@ def inspect_binary(binary: str) -> Optional[PhpInstall]:
     verdict = assess(parse_version(raw))
     install = PhpInstall(binary=binary, raw_version=raw.strip().splitlines()[0] if raw.strip() else "",
                          verdict=verdict)
+    install.package = package_for_binary(binary)
+    if install.package:
+        text = read_package_changelog(install.package)
+        install.package.cves = changelog_cves(text) if text is not None else None
+        apply_backport(install)
     # `php-fpm -i` reports the FPM SAPI's ini, which can differ from the CLI's.
     if os.path.basename(binary).startswith("php"):
         install.config = read_ini_posture(binary)
@@ -420,6 +530,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         v = ins.verdict
         if v.status == STATUS_PATCHED:
             tag = _c("OK — patched", "green", use_color)
+        elif v.status == STATUS_PATCHED_BACKPORT:
+            tag = _c("OK, patched (distro backport)", "green", use_color)
         elif v.affected:
             tag = _c("AFFECTED", "red", use_color)
         else:
@@ -428,6 +540,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         if ins.raw_version:
             print(f"    {ins.raw_version}")
         print(f"    {tag}: {v.detail}")
+        for note in backport_notes(ins):
+            print(f"    note: {note}")
         for note in posture_notes(ins):
             print(f"    note: {note}")
         for note in session_handler_notes(ins):
@@ -1552,6 +1666,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "session_handler_notes": session_handler_notes(i),
                     "stale_processes": [asdict(s) for s in i.stale],
                     "detail": i.verdict.detail,
+                    "package": asdict(i.package) if i.package else None,
+                    "backport_notes": backport_notes(i),
                 }
                 for i in installs
             ],
