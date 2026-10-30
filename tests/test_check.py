@@ -29,6 +29,9 @@ from php2shell_check import (  # noqa: E402
     parse_version,
     scan_file,
     scan_docker_files,
+    scan_running_containers,
+    probe_image,
+    probe_container,
     read_inventory,
     check_to_sarif,
     scan_to_sarif,
@@ -946,6 +949,167 @@ class BackportTests(unittest.TestCase):
         ins = self._inspect(None)
         self.assertTrue(ins.verdict.affected)
         self.assertIsNone(ins.package.cves)
+
+
+class DockerProbeTests(unittest.TestCase):
+    def _run(self, *results):
+        """Put docker on PATH and make subprocess.run return `results` in order."""
+        procs = [subprocess.CompletedProcess(["docker"], rc, out, err) for rc, out, err in results]
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch("php2shell_check.shutil.which",
+                                       side_effect=lambda n: "/usr/bin/docker" if n == "docker" else None))
+        return stack.enter_context(mock.patch("php2shell_check.subprocess.run", side_effect=procs))
+
+    def test_probe_image_uses_sh_probe_and_no_network(self):
+        run = self._run((0, "BIN /usr/local/sbin/php-fpm\nVER PHP 8.3.10 (fpm-fcgi)\n", ""))
+        installs = probe_image("php:8.3.10-fpm")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:2], ["docker", "run"])
+        self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+        self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "sh")
+        self.assertEqual(cmd[-2:], ["php:8.3.10-fpm", "-s"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs["input"], build_remote_probe())
+        self.assertEqual(installs[0].binary, "image php:8.3.10-fpm: /usr/local/sbin/php-fpm")
+        self.assertTrue(installs[0].verdict.affected)
+
+    def test_probe_image_distroless_fallback(self):
+        run = self._run((127, "", 'exec: "sh": executable file not found in $PATH'),
+                        (0, "PHP 8.4.27 (cli) (built: Oct 21 2026)\n", ""))
+        installs = probe_image("example/php-distroless:8.4")
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0].verdict.status, STATUS_PATCHED)
+        cmd = run.call_args_list[1].args[0]
+        self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "php")
+        self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+        self.assertEqual(cmd[-1], "-v")
+
+    def test_probe_image_no_php_is_unknown(self):
+        self._run((0, "", ""), (127, "", 'exec: "php": executable file not found in $PATH\n'))
+        installs = probe_image("alpine:3.20")
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0].verdict.status, STATUS_UNKNOWN)
+        self.assertIn("executable file not found", installs[0].verdict.detail)
+
+    def test_option_like_image_rejected_before_docker(self):
+        with mock.patch("php2shell_check.subprocess.run") as run:
+            (ins,) = probe_image("--privileged")
+            (cont,) = probe_container("--privileged", "web")
+        run.assert_not_called()
+        self.assertEqual(ins.verdict.status, STATUS_UNKNOWN)
+        self.assertEqual(cont.verdict.status, STATUS_UNKNOWN)
+
+    def test_docker_failures_become_unknown(self):
+        for effect, text in [(FileNotFoundError(), "docker"),
+                             (subprocess.TimeoutExpired("docker", 1), "timed out")]:
+            with self.subTest(text=text), \
+                    mock.patch("php2shell_check.shutil.which", return_value="/usr/bin/docker"), \
+                    mock.patch("php2shell_check.subprocess.run", side_effect=effect):
+                (ins,) = probe_image("php:8.3.10")
+                self.assertEqual(ins.verdict.status, STATUS_UNKNOWN)
+                self.assertIn(text, ins.verdict.detail)
+
+    def test_docker_missing_is_a_note(self):
+        with mock.patch("php2shell_check.shutil.which", return_value=None), \
+                mock.patch("php2shell_check.subprocess.run") as run:
+            hits, note = scan_running_containers()
+            self.assertEqual(hits, [])
+            self.assertIn("docker", note)
+            cwd = os.getcwd()
+            with tempfile.TemporaryDirectory() as empty:
+                os.chdir(empty)
+                try:
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        code = main(["scan-docker", "--image", "php:8.3"])
+                finally:
+                    os.chdir(cwd)
+        run.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertIn("[UNKNOWN]", out.getvalue())
+        self.assertIn("docker CLI not found on PATH", out.getvalue())
+
+    def test_official_image_has_no_package_line(self):
+        self._run((0, "BIN /usr/local/bin/php\nVER PHP 8.2.20 (cli)\n", ""))
+        (ins,) = probe_image("php:8.2.20-cli")
+        self.assertIsNone(ins.package)
+        self.assertEqual(backport_notes(ins), [])
+        self.assertTrue(ins.verdict.affected)
+
+    def test_running_containers_probe_cli_and_fpm(self):
+        run = self._run(
+            (0, "abc123\tweb\tphp:8.3.10-fpm\n", ""),
+            (0, "BIN /usr/local/bin/php\nVER PHP 8.3.10 (cli)\n"
+                "BIN /usr/local/sbin/php-fpm\nVER PHP 8.3.10 (fpm-fcgi)\n", ""))
+        hits, note = scan_running_containers()
+        self.assertIsNone(note)
+        ps = run.call_args_list[0].args[0]
+        self.assertEqual(ps[-2:], ["--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"])
+        exe = run.call_args_list[1].args[0]
+        self.assertEqual(exe, ["docker", "exec", "-i", "abc123", "sh", "-s"])
+        self.assertEqual(run.call_args_list[1].kwargs["input"], build_remote_probe())
+        self.assertEqual(len(hits), 2)
+        self.assertEqual({h.source for h in hits}, {"container web (php:8.3.10-fpm)"})
+        self.assertTrue(all(h.verdict.affected for h in hits))
+        self.assertEqual([h.install.binary for h in hits],
+                         ["container web: /usr/local/bin/php", "container web: /usr/local/sbin/php-fpm"])
+
+    def test_running_container_fallback_and_no_php_skipped(self):
+        run = self._run((0, "abc123\tapp\tphp-distroless\ndef456\tdb\tpostgres:16\n", ""),
+                        (126, "", 'exec: "sh": executable file not found\n'),
+                        (0, "PHP 8.4.27 (cli)\n", ""),
+                        (0, "", ""),
+                        (126, "", 'exec: "php": executable file not found\n'))
+        hits, note = scan_running_containers()
+        self.assertEqual(run.call_args_list[2].args[0], ["docker", "exec", "abc123", "php", "-v"])
+        self.assertEqual([h.source for h in hits], ["container app (php-distroless)"])
+        self.assertEqual(hits[0].verdict.status, STATUS_PATCHED)
+
+    def _cli(self, argv, installs):
+        out = io.StringIO()
+        with mock.patch("php2shell_check.probe_image", return_value=installs) as probe, \
+                contextlib.redirect_stdout(out):
+            code = main(argv)
+        return code, out.getvalue(), probe
+
+    def test_cli_image_json_adds_install_keys(self):
+        ins = parse_remote_probe("image php:8.2.20", "BIN /usr/bin/php8.2\nVER PHP 8.2.20 (cli)\n"
+                                 "PKG dpkg php8.2-cli 8.2.20-1+deb11u9\nCVE CVE-2026-109618\n"
+                                 "STALE 7 php-fpm8.2 binary replaced on disk (/usr/sbin/php-fpm8.2)\n")
+        dockerfile = tempfile.NamedTemporaryFile("w", suffix="Dockerfile", delete=False)
+        dockerfile.write("FROM php:8.4.27-cli\n")
+        dockerfile.close()
+        self.addCleanup(os.unlink, dockerfile.name)
+        code, out, probe = self._cli(["scan-docker", dockerfile.name, "--image", "php:8.2.20",
+                                      "--image", "php:8.4.27", "--json"], ins)
+        self.assertEqual([c.args[0] for c in probe.call_args_list], ["php:8.2.20", "php:8.4.27"])
+        self.assertEqual(code, 1)
+        doc = json.loads(out)
+        file_hit, image_hit = doc["hits"][0], doc["hits"][1]
+        self.assertEqual(set(file_hit), {"source", "line", "image", "version", "status",
+                                         "affected", "detail"})
+        self.assertEqual(image_hit["package"]["name"], "php8.2-cli")
+        self.assertEqual(image_hit["stale_processes"][0]["pids"], [7])
+        self.assertTrue(any("CVE-2026-109619" in n for n in image_hit["backport_notes"]))
+        self.assertIn("config", image_hit)
+
+    def test_cli_stale_only_fails_and_counts_high(self):
+        ins = parse_remote_probe("image x", "BIN /usr/local/bin/php\nVER PHP 8.4.27 (cli)\n"
+                                 "STALE 7 php binary replaced on disk (/usr/local/bin/php)\n")
+        code, out, _ = self._cli(["scan-docker", "--image", "x"], ins)
+        self.assertEqual(code, 1)
+        self.assertIn("replaced on disk", out)
+        code, _, _ = self._cli(["scan-docker", "--image", "x", "--fail-on", "high"], ins)
+        self.assertEqual(code, 1)
+
+    def test_cli_backport_label(self):
+        ins = parse_remote_probe("image x", "BIN /usr/bin/php8.2\nVER PHP 8.2.20 (cli)\n"
+                                 "PKG dpkg php8.2-cli 8.2.20-1+deb11u9\n"
+                                 "CVE CVE-2026-109618\nCVE CVE-2026-109619\n")
+        code, out, _ = self._cli(["scan-docker", "--image", "x"], ins)
+        self.assertEqual(code, 0)
+        self.assertIn("[OK (distro backport)]", out)
 
 
 if __name__ == "__main__":

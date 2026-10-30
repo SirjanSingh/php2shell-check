@@ -1335,6 +1335,7 @@ class DockerHit:
     line_no: int
     image_tag: str
     verdict: Verdict
+    install: Optional[PhpInstall] = None  # set when an image or container was probed
 
 
 def scan_docker_files(paths: list) -> list:
@@ -1352,62 +1353,158 @@ def scan_docker_files(paths: list) -> list:
     return hits
 
 
+# Images and containers get the same read-only probe as SSH hosts, piped to
+# `sh -s` on stdin. Images run with `--network none`. One with no `sh`
+# (distroless) falls back to `php -v`.
+_IMAGE_RE =re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+
+
+def _docker_probe(sh_cmd: list, php_cmd: list, label: str, timeout: int) -> list:
+    """Run the probe through docker. Never raises: anything that stops the
+    probe comes back as an UNKNOWN record carrying the reason."""
+    def unknown(reason: str) -> list:
+        return [PhpInstall(label, "", Verdict(None, STATUS_UNKNOWN, reason))]
+
+    def run(cmd: list, **kw) -> tuple:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout, **kw), None
+        except subprocess.TimeoutExpired:
+            return None, f"docker timed out after {timeout}s"
+        except OSError as exc:
+            return None, f"could not run docker: {exc}"
+
+    if not shutil.which("docker"):
+        return unknown("docker CLI not found on PATH")
+    proc, err = run(sh_cmd, input=build_remote_probe())
+    if err:
+        return unknown(err)
+    if proc.stdout.strip():
+        return parse_remote_probe(label, proc.stdout)
+    # Nothing printed: no `sh` in the image, or no PHP on its PATH.
+    sh_rc = proc.returncode
+    proc, err = run(php_cmd, stdin=subprocess.DEVNULL)
+    if err:
+        return unknown(err)
+    out = _clean((proc.stdout or "").replace("\r", ""))
+    ver = parse_version(out) if proc.returncode == 0 else None
+    if ver is None:
+        lines = _clean(proc.stderr or "").strip().splitlines()
+        return unknown(f"no PHP found (sh probe exit {sh_rc}, php -v exit "
+                       f"{proc.returncode}): {lines[-1] if lines else 'no error output'}")
+    first = out.strip().splitlines()[0]
+    return [PhpInstall(f"{label}: php", first, assess(ver))]
+
+
+def probe_image(image: str, timeout: int = 300) -> list:
+    """Probe an image in a throwaway, network-less container. docker pulls
+    the image first if it is not present locally."""
+    label = f"image {_clean(image)}"
+    if not _IMAGE_RE.match(image):
+        return [PhpInstall(label, "", Verdict(
+            None, STATUS_UNKNOWN, f"not a plain image reference: {_clean(image)!r}"))]
+    return _docker_probe(
+        ["docker", "run", "--rm", "-i", "--network", "none", "--entrypoint", "sh", image, "-s"],
+        ["docker", "run", "--rm", "--network", "none", "--entrypoint", "php", image, "-v"],
+        label, timeout)
+
+
+def probe_container(cid: str, name: str, timeout: int = 60) -> list:
+    """Probe a running container with `docker exec`."""
+    label = f"container {_clean(name)}"
+    if not _IMAGE_RE.match(cid):
+        return [PhpInstall(label, "", Verdict(
+            None, STATUS_UNKNOWN, f"not a plain container id: {_clean(cid)!r}"))]
+    return _docker_probe(["docker", "exec", "-i", cid, "sh", "-s"],
+                         ["docker", "exec", cid, "php", "-v"], label, timeout)
+
+
 def scan_running_containers() -> tuple:
-    docker = shutil.which("docker")
-    if not docker:
+    if not shutil.which("docker"):
         return [], "docker CLI not found on PATH"
-    out = _run([docker, "ps", "--format", "{{.ID}} {{.Image}}"])
+    out = _run_ok(["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"])
     if out is None:
         return [], "could not run `docker ps` (is the daemon running / permitted?)"
     hits = []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if not parts:
+    for line in _clean(out.replace("\r", "")).splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or not parts[0]:
             continue
-        cid, image = parts[0], (parts[1] if len(parts) > 1 else "?")
-        ver = parse_version(_run([docker, "exec", cid, "php", "-v"]) or "")
-        if ver is None:
-            continue
-        hits.append(DockerHit(f"container {cid} ({image})", 0, image, assess(ver)))
+        cid, name, image = parts
+        label = f"container {name}"
+        for ins in probe_container(cid, name):
+            # A container with no PHP binary (a database, a proxy) is not a finding.
+            if ins.binary == label and not ins.stale:
+                continue
+            hits.append(DockerHit(f"{label} ({image})", 0, image, ins.verdict, install=ins))
     return hits, None
 
 
 def cmd_scan_docker(args: argparse.Namespace) -> int:
     paths = args.paths or [p for p in DEFAULT_DOCKER_FILES if os.path.exists(p)]
     hits = scan_docker_files(paths)
+    image_hits = [DockerHit(f"image {_clean(image)}", 0, _clean(image), ins.verdict, install=ins)
+                  for image in (args.image or []) for ins in probe_image(image)]
+    hits.extend(image_hits)
     note = None
     if args.running:
         running, note = scan_running_containers()
         hits.extend(running)
 
-    affected = [h for h in hits if h.verdict.affected]
+    def stale(h: DockerHit) -> bool:
+        return bool(h.install and h.install.stale)
+
+    affected = [h for h in hits if h.verdict.affected or stale(h)]
     unknown = [h for h in hits if h.verdict.status == STATUS_UNKNOWN]
 
     if args.json:
-        print(json.dumps({"cves": CVES, "note": note, "hits": [
-            {"source": h.source, "line": h.line_no, "image": h.image_tag,
-             "version": h.verdict.version_str, "status": h.verdict.status,
-             "affected": h.verdict.affected, "detail": h.verdict.detail}
-            for h in hits]}, indent=2))
+        rows = []
+        for h in hits:
+            row = {"source": h.source, "line": h.line_no, "image": h.image_tag,
+                   "version": h.verdict.version_str, "status": h.verdict.status,
+                   "affected": h.verdict.affected, "detail": h.verdict.detail}
+            if h.install:
+                row.update({
+                    "config": h.install.config,
+                    "package": asdict(h.install.package) if h.install.package else None,
+                    "stale_processes": [asdict(s) for s in h.install.stale],
+                    "backport_notes": backport_notes(h.install),
+                })
+            rows.append(row)
+        print(json.dumps({"cves": CVES, "note": note, "hits": rows}, indent=2))
     else:
         print(f"PHP2Shell Docker scan  ({', '.join(CVES)})\n")
         if note:
             print(f"  note: {note}\n")
         if not hits:
-            print("  No PHP images found. Pass Dockerfile/compose paths, or --running.")
+            print("  No PHP images found. Pass Dockerfile/compose paths, --image, or --running.")
             return 0
         for h in hits:
             tag = ("AFFECTED" if h.verdict.affected else
-                   "OK" if h.verdict.status == STATUS_PATCHED else "UNKNOWN")
+                   "OK" if h.verdict.status == STATUS_PATCHED else
+                   "OK (distro backport)" if h.verdict.status == STATUS_PATCHED_BACKPORT else
+                   "UNKNOWN")
             loc = h.source + (f":{h.line_no}" if h.line_no else "")
             print(f"  [{tag}] {h.image_tag}  {loc}")
+            if h.install and h.install.raw_version:
+                print(f"      {h.install.binary}: {h.install.raw_version}")
             print(f"      {h.verdict.detail}")
-        if unknown:
+            if h.install:
+                for n in backport_notes(h.install):
+                    print(f"      note: {n}")
+                print_stale(h.install.stale, use_color=False, indent="      ")
+        if any(h.install is None for h in unknown):
             print("\n  UNKNOWN = a branch tag with no patch number (e.g. php:8.3). "
                   "Pin a full patched tag such as php:8.3.36.")
-    sevs = ["high" if h.verdict.affected else "medium"
-            for h in hits if h.verdict.affected or h.verdict.status == STATUS_UNKNOWN]
-    return exit_code_for(sevs, args.fail_on, 1 if affected else 0)
+    if affected:
+        default = 1
+    elif image_hits and all(h.verdict.status == STATUS_UNKNOWN for h in image_hits):
+        default = 2
+    else:
+        default = 0
+    sevs = ["high" if h.verdict.affected or stale(h) else "medium"
+            for h in hits if h.verdict.affected or stale(h) or h.verdict.status == STATUS_UNKNOWN]
+    return exit_code_for(sevs, args.fail_on, default)
 
 
 # --- SSH fleet mode ----------------------------------------------------------
@@ -1774,8 +1871,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="scan Dockerfiles/compose files and running containers")
     d.add_argument("paths", nargs="*",
                    help="Dockerfile/compose paths (default: common files in cwd)")
+    d.add_argument("--image", action="append", metavar="IMAGE",
+                   help="probe an image in a throwaway container with no network "
+                        "(docker pulls it if missing). Repeatable")
     d.add_argument("--running", action="store_true",
-                   help="also read PHP versions from running containers via docker")
+                   help="also probe running containers via `docker exec` (read-only)")
     d.add_argument("--json", action="store_true", help="machine-readable output")
     add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
