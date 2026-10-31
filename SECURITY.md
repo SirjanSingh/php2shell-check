@@ -15,6 +15,14 @@ read-only script over `ssh` (key auth only, your `known_hosts` honoured, host
 entries that could be read as ssh options rejected) and writes nothing on the
 host. Only ever test systems you own or are explicitly authorized to test.
 
+`scan-docker --image` probes run in a throwaway container with `--network none`,
+`--cap-drop ALL` and `--security-opt no-new-privileges`, so the image under test
+cannot reach the network. The probe runs the image's own `sh` and `php` as the
+image's `USER`; those flags limit what they can do but do not make running a
+hostile image safe, so only probe images you would run anyway. `--running` uses
+`docker exec` with the same read-only script. Anything read from a host, container or package changelog is treated as
+untrusted and stripped of control characters or HTML-escaped before display.
+
 `rules` only prints or writes rule files; it never contacts a host.
 
 ## This is not a substitute for patching

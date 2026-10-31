@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-31
+
+### Added
+- Distro backports: an affected version is reported as patched (backport) when
+  the package that owns the php binary (`dpkg` or `rpm`) has the same upstream
+  version PHP reports and its changelog names both CVE-2026-109618 and
+  CVE-2026-109619. Less evidence adds a note and leaves the verdict alone. Works
+  locally, over `--ssh-hosts` and in container probes.
+- `scan-docker --image IMAGE` (repeatable) probes an image in a throwaway
+  container, and `--running` now probes containers for real (CLI and FPM, ini
+  posture, package, restart check) instead of only reading tags. Image probes run
+  with `--network none`, `--cap-drop ALL` and `--security-opt no-new-privileges`.
+  A failed probe is reported as UNKNOWN, and when nothing is affected and every
+  `--image` probe is UNKNOWN, `scan-docker` exits `2`.
+- `--markdown FILE` and `--html FILE` reports on `check` and `scan-docker`. The
+  HTML is one self-contained file.
+- A composite GitHub Action (`action.yml`) with inputs `command`, `args`,
+  `fail-on` and `python-version`, the output `exit-code`, and a job-summary report.
+- CI coverage that runs against real Docker.
+- README: "How it compares" table and a report screenshot.
+
+### Changed
+- `scan-docker` JSON gains `config`, `package`, `stale_processes`,
+  `backport_notes` and a binary key; `check` JSON gains `package` and
+  `backport_notes`. Existing keys, exit codes and `--fail-on` are unchanged.
+- `scan-docker` JSON `source` for a running container is now
+  `container <name> (<image>)` (was `container <id> (<image>)`), and one
+  container can yield several rows (for example `php` and `php-fpm`).
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

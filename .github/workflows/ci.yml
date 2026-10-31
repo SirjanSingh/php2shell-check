@@ -52,6 +52,15 @@ jobs:
           printf -- '-oProxyCommand=x\n' > bad-hosts.txt
           python php2shell_check.py check --ssh-hosts bad-hosts.txt --fail-on high
           python php2shell_check.py check --ssh-hosts bad-hosts.txt --fail-on medium && exit 1 || true
+          # Real Docker (the ubuntu runners have it). Images run with --network none.
+          rc=0; python php2shell_check.py scan-docker --image php:8.3.10-cli --json > image.json || rc=$?
+          test "$rc" = 1
+          python -c "import json; assert json.load(open('image.json'))['hits'][0]['affected']"
+          python php2shell_check.py scan-docker --image php:8.4.27-cli
+          docker run -d --name p2s php:8.3.10-fpm
+          # Exits 1 for the affected php and php-fpm, so the JSON is asserted instead.
+          python php2shell_check.py scan-docker --running --json > running.json || true
+          python -c "import json; hits = json.load(open('running.json'))['hits']; bins = {h['binary'].rsplit('/', 1)[-1] for h in hits if h['source'].startswith('container p2s ')}; assert {'php', 'php-fpm'} <= bins, bins"
       - name: Restart check against a real replaced process
         run: |
           # A copy of bash named phpx stands in for php-fpm. (Not /bin/sleep:
@@ -82,3 +91,34 @@ jobs:
         run: |
           python -m pip install dist/*.whl
           php2shell-check check --version 8.4.27
+
+  action:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write a Dockerfile on an affected PHP image
+        run: printf 'FROM php:8.3.10-fpm\n' > Dockerfile.ci
+      # The action exits 1 here, so the step is allowed to fail and its output is asserted.
+      - name: Run the action on an affected Dockerfile
+        id: p2s
+        uses: ./
+        continue-on-error: true
+        with:
+          command: scan-docker
+          args: Dockerfile.ci
+      - name: Assert the action exits 1
+        env:
+          EXIT_CODE: ${{ steps.p2s.outputs.exit-code }}
+        run: test "$EXIT_CODE" = 1
+      - name: Run the action with fail-on none
+        id: p2s-none
+        uses: ./
+        continue-on-error: true
+        with:
+          command: scan-docker
+          args: Dockerfile.ci
+          fail-on: none
+      - name: Assert the action exits 0
+        env:
+          EXIT_CODE: ${{ steps.p2s-none.outputs.exit-code }}
+        run: test "$EXIT_CODE" = 0

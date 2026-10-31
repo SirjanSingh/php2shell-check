@@ -28,9 +28,11 @@ Usage:
     php2shell-check check [--php-binary PATH] [--version X.Y.Z] [--json]
                           [--inventory FILE | --ssh-hosts FILE [--ssh-jobs N]]
                           [--no-restart-check] [--fail-on LEVEL]
+                          [--markdown FILE] [--html FILE]
     php2shell-check harden [--apply] [--conf-dir DIR] [--php-binary PATH]
     php2shell-check scan-logs LOGFILE [...] [--fail-on LEVEL]
-    php2shell-check scan-docker [PATH ...] [--running] [--fail-on LEVEL]
+    php2shell-check scan-docker [PATH ...] [--image IMAGE ...] [--running]
+                                [--fail-on LEVEL] [--markdown FILE] [--html FILE]
     php2shell-check scan-code PATH [...] [--json] [--fail-on LEVEL]
     php2shell-check rules [--format modsecurity|sigma|suricata|all]
                           [--output DIR] [--block]
@@ -39,12 +41,16 @@ Exit codes (check):
     0  not affected (patched, or a branch with no known issue)
     1  affected, or PHP processes still running code replaced on disk
     2  could not determine (no PHP found / unparseable version)
+Exit codes (scan-docker): the same 0 and 1; 2 when nothing is affected and
+every --image probe is UNKNOWN (or a report file cannot be written).
 --fail-on high|medium|low|none changes this to "1 only at or above that level".
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
+import html
 import json
 import os
 import re
@@ -52,10 +58,12 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zlib
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Optional
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # --- Vulnerability data -----------------------------------------------------
 
@@ -108,6 +116,8 @@ STATUS_PATCHED = "patched"
 STATUS_VULNERABLE = "vulnerable"
 STATUS_VULNERABLE_EOL = "vulnerable_eol"
 STATUS_UNKNOWN = "unknown"
+# A version-affected build whose distro changelog names both CVEs.
+STATUS_PATCHED_BACKPORT = "patched_backport"
 
 
 @dataclass
@@ -175,6 +185,14 @@ def assess(version: Optional[tuple[int, int, int]]) -> Verdict:
 # --- PHP discovery ----------------------------------------------------------
 
 @dataclass
+class PackageInfo:
+    manager: str  # "dpkg" | "rpm"
+    name: str
+    version: str
+    cves: Optional[list]  # IDs from CVES found in the changelog, sorted; None = changelog not available
+
+
+@dataclass
 class PhpInstall:
     binary: str
     raw_version: str
@@ -182,6 +200,7 @@ class PhpInstall:
     upload_progress_enabled: Optional[bool] = None
     config: dict = field(default_factory=dict)
     stale: list = field(default_factory=list)
+    package: Optional[PackageInfo] = None
 
 
 def _run(cmd: list[str]) -> Optional[str]:
@@ -190,6 +209,117 @@ def _run(cmd: list[str]) -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
     return (out.stdout or "") + (out.stderr or "")
+
+
+def _run_ok(cmd: list[str]) -> Optional[str]:
+    """stdout of a command that exited 0, else None (also when it is not installed)."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# --- distro backports --------------------------------------------------------
+#
+# Some vendors fix a CVE without moving to the upstream fixed version (RHEL
+# 8.0.30-8.el9_8.1, AlmaLinux .alma.1 rebuilds, Remi builds of EOL branches), so
+# the version string alone over-reports. Debian and Ubuntu security updates move
+# to the fixed upstream version, which the version check already covers. An
+# affected version counts as patched only when the package that owns the binary
+# is that same upstream version and its changelog names BOTH CVE IDs.
+
+_PKG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]*")
+
+
+def changelog_cves(text: str) -> list:
+    """The members of CVES that appear in `text`, sorted. An ID followed by
+    another digit is a different CVE (CVE-2026-1096185), so it does not count."""
+    return sorted(c for c in CVES if re.search(re.escape(c) + r"(?![0-9])", text))
+
+
+def package_for_binary(binary: str) -> Optional[PackageInfo]:
+    """The dpkg or rpm package that owns `binary`, or None when neither tool
+    is installed or neither owns the file."""
+    path = os.path.realpath(binary)
+    if shutil.which("dpkg"):
+        owner = _run_ok(["dpkg", "-S", path])
+        if owner and owner.strip():
+            name = owner.splitlines()[0].split(":")[0].split(",")[0].strip()
+            version = _run_ok(["dpkg-query", "-W", "-f=${Version}", name]) if shutil.which("dpkg-query") else None
+            if version and version.strip() and _PKG_NAME_RE.fullmatch(name):
+                return PackageInfo("dpkg", name, _clean(version.strip()), None)
+    if shutil.which("rpm"):
+        owner = _run_ok(["rpm", "-qf", "--qf", "%{NAME} %{VERSION}-%{RELEASE}", path])
+        parts = owner.split() if owner else []
+        if len(parts) == 2 and _PKG_NAME_RE.fullmatch(parts[0]):
+            return PackageInfo("rpm", parts[0], _clean(parts[1]), None)
+    return None
+
+
+def read_package_changelog(pkg: PackageInfo, doc_root: str = "/usr/share/doc") -> Optional[str]:
+    """The package's changelog text, or None if nothing is readable. An empty
+    changelog is None too: it proves nothing about the CVEs (the sh probe
+    says NOCHANGELOG for it). `doc_root` is injectable for tests."""
+    if pkg.manager == "rpm":
+        text = _run_ok(["rpm", "-q", "--changelog", pkg.name])
+        return text if text and text.strip() else None
+    # php8.2-cli ships no changelog of its own; php8.2-common carries it.
+    names = [pkg.name]
+    common = re.sub(r"-[a-z]+$", "-common", pkg.name)
+    if common not in names:
+        names.append(common)
+    for name in names:
+        try:
+            with gzip.open(os.path.join(doc_root, name, "changelog.Debian.gz"), "rt",
+                           encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            return text if text.strip() else None
+        except (OSError, EOFError, zlib.error):
+            continue
+    return None
+
+
+def _package_matches(ins: PhpInstall) -> bool:
+    """True when the package's upstream version (no epoch, no release) is the
+    version PHP itself reports. A source build or a COPY --from binary over a
+    packaged path runs other code than the package's changelog describes."""
+    upstream = parse_version(ins.package.version.split(":", 1)[-1].rsplit("-", 1)[0])
+    return upstream is not None and upstream == ins.verdict.version
+
+
+def apply_backport(ins: PhpInstall) -> None:
+    """Upgrade an affected verdict to patched_backport when the owning
+    package is the running build and its changelog names every CVE in CVES."""
+    pkg = ins.package
+    if not (ins.verdict.affected and pkg and pkg.cves is not None
+            and all(c in pkg.cves for c in CVES) and _package_matches(ins)):
+        return
+    old = ins.verdict
+    ins.verdict = Verdict(
+        old.version, STATUS_PATCHED_BACKPORT,
+        f"PHP {old.version_str} with a distro backport: {pkg.manager} package "
+        f"{_clean(pkg.name)} {_clean(pkg.version)} changelog names {', '.join(CVES)}.",
+        fixed_version=old.fixed_version)
+
+
+def backport_notes(ins: PhpInstall) -> list[str]:
+    """Why an affected install with a known package was not treated as patched."""
+    pkg = ins.package
+    if not pkg or not ins.verdict.affected:
+        return []
+    who = f"package {_clean(pkg.name)} {_clean(pkg.version)}"
+    if not _package_matches(ins):
+        return [f"{who} does not match running PHP {ins.verdict.version_str}; "
+                f"not treated as patched"]
+    if pkg.cves is None:
+        return [f"{who}: changelog not available, cannot confirm a distro backport; "
+                f"check your vendor advisory"]
+    found = ", ".join(pkg.cves) or "neither CVE"
+    missing = ", ".join(c for c in CVES if c not in pkg.cves)
+    if not missing:
+        return []  # apply_backport upgrades this install; nothing to explain
+    return [f"{who}: changelog names {found}, missing {missing}; not treated as patched"]
 
 
 PHP_CANDIDATES = ("php", "php-fpm", "php8.5", "php8.4", "php8.3", "php8.2",
@@ -249,6 +379,11 @@ def inspect_binary(binary: str) -> Optional[PhpInstall]:
     verdict = assess(parse_version(raw))
     install = PhpInstall(binary=binary, raw_version=raw.strip().splitlines()[0] if raw.strip() else "",
                          verdict=verdict)
+    install.package = package_for_binary(binary)
+    if install.package:
+        text = read_package_changelog(install.package)
+        install.package.cves = changelog_cves(text) if text is not None else None
+        apply_backport(install)
     # `php-fpm -i` reports the FPM SAPI's ini, which can differ from the CLI's.
     if os.path.basename(binary).startswith("php"):
         install.config = read_ini_posture(binary)
@@ -420,6 +555,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         v = ins.verdict
         if v.status == STATUS_PATCHED:
             tag = _c("OK — patched", "green", use_color)
+        elif v.status == STATUS_PATCHED_BACKPORT:
+            tag = _c("OK, patched (distro backport)", "green", use_color)
         elif v.affected:
             tag = _c("AFFECTED", "red", use_color)
         else:
@@ -428,6 +565,8 @@ def print_human(installs: list[PhpInstall], use_color: bool,
         if ins.raw_version:
             print(f"    {ins.raw_version}")
         print(f"    {tag}: {v.detail}")
+        for note in backport_notes(ins):
+            print(f"    note: {note}")
         for note in posture_notes(ins):
             print(f"    note: {note}")
         for note in session_handler_notes(ins):
@@ -1221,6 +1360,7 @@ class DockerHit:
     line_no: int
     image_tag: str
     verdict: Verdict
+    install: Optional[PhpInstall] = None  # set when an image or container was probed
 
 
 def scan_docker_files(paths: list) -> list:
@@ -1238,62 +1378,175 @@ def scan_docker_files(paths: list) -> list:
     return hits
 
 
+# Images and containers get the same read-only probe as SSH hosts, piped to
+# `sh -s` on stdin. Images run with `--network none` and no capabilities. One with no `sh`
+# (distroless) falls back to `php -v`.
+_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+# Detail prefix of a probe that ran and found no PHP (as opposed to one that failed).
+_NO_PHP = "no PHP found"
+
+
+def _docker_probe(sh_cmd: list, php_cmd: list, label: str, timeout: int) -> list:
+    """Run the probe through docker. Never raises: anything that stops the
+    probe comes back as an UNKNOWN record carrying the reason."""
+    def unknown(reason: str) -> list:
+        return [PhpInstall(label, "", Verdict(None, STATUS_UNKNOWN, reason))]
+
+    def run(cmd: list, **kw) -> tuple:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout, **kw), None
+        except subprocess.TimeoutExpired:
+            return None, f"docker timed out after {timeout}s"
+        except OSError as exc:
+            return None, f"could not run docker: {exc}"
+
+    if not shutil.which("docker"):
+        return unknown("docker CLI not found on PATH")
+    proc, err = run(sh_cmd, input=build_remote_probe())
+    if err:
+        return unknown(err)
+    if proc.stdout.strip():
+        return parse_remote_probe(label, proc.stdout)
+    # Nothing printed: no `sh` in the image, or no PHP on its PATH.
+    sh_rc = proc.returncode
+    proc, err = run(php_cmd, stdin=subprocess.DEVNULL)
+    if err:
+        return unknown(err)
+    out = _clean((proc.stdout or "").replace("\r", ""))
+    ver = parse_version(out) if proc.returncode == 0 else None
+    if ver is None:
+        stderr = _clean(proc.stderr or "")
+        lines = stderr.strip().splitlines()
+        # 127 (or docker exec's 126 with "executable file not found"): `php` is
+        # not there. Any other 126 means it is there but cannot be invoked.
+        missing = sh_rc in (0, 126, 127) and (proc.returncode == 127
+                                              or "executable file not found" in stderr)
+        what = _NO_PHP if missing else "docker probe failed"
+        return unknown(f"{what} (sh probe exit {sh_rc}, php -v exit "
+                       f"{proc.returncode}): {lines[-1] if lines else 'no error output'}")
+    first = out.strip().splitlines()[0]
+    return [PhpInstall(f"{label}: php", first, assess(ver))]
+
+
+def probe_image(image: str, timeout: int = 300) -> list:
+    """Probe an image in a throwaway, network-less container. docker pulls
+    the image first if it is not present locally."""
+    label = f"image {_clean(image)}"
+    if not _IMAGE_RE.match(image):
+        return [PhpInstall(label, "", Verdict(
+            None, STATUS_UNKNOWN, f"not a plain image reference: {_clean(image)!r}"))]
+    hardening = ["--network", "none", "--cap-drop", "ALL",
+                 "--security-opt", "no-new-privileges"]
+    return _docker_probe(
+        ["docker", "run", "--rm", "-i", *hardening, "--entrypoint", "sh", image, "-s"],
+        ["docker", "run", "--rm", *hardening, "--entrypoint", "php", image, "-v"],
+        label, timeout)
+
+
+def probe_container(cid: str, name: str, timeout: int = 60) -> list:
+    """Probe a running container with `docker exec`."""
+    label = f"container {_clean(name)}"
+    if not _IMAGE_RE.match(cid):
+        return [PhpInstall(label, "", Verdict(
+            None, STATUS_UNKNOWN, f"not a plain container id: {_clean(cid)!r}"))]
+    return _docker_probe(["docker", "exec", "-i", cid, "sh", "-s"],
+                         ["docker", "exec", cid, "php", "-v"], label, timeout)
+
+
 def scan_running_containers() -> tuple:
-    docker = shutil.which("docker")
-    if not docker:
+    if not shutil.which("docker"):
         return [], "docker CLI not found on PATH"
-    out = _run([docker, "ps", "--format", "{{.ID}} {{.Image}}"])
+    out = _run_ok(["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"])
     if out is None:
         return [], "could not run `docker ps` (is the daemon running / permitted?)"
     hits = []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if not parts:
+    for line in _clean(out.replace("\r", "")).splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or not parts[0]:
             continue
-        cid, image = parts[0], (parts[1] if len(parts) > 1 else "?")
-        ver = parse_version(_run([docker, "exec", cid, "php", "-v"]) or "")
-        if ver is None:
-            continue
-        hits.append(DockerHit(f"container {cid} ({image})", 0, image, assess(ver)))
+        cid, name, image = parts
+        label = f"container {name}"
+        for ins in probe_container(cid, name):
+            # A container with no PHP binary (a database, a proxy) is not a finding;
+            # a probe that failed (timeout, exec refused) is, as UNKNOWN.
+            if (ins.binary == label and not ins.stale
+                    and ins.verdict.detail.startswith(_NO_PHP)):
+                continue
+            hits.append(DockerHit(f"{label} ({image})", 0, image, ins.verdict, install=ins))
     return hits, None
 
 
 def cmd_scan_docker(args: argparse.Namespace) -> int:
     paths = args.paths or [p for p in DEFAULT_DOCKER_FILES if os.path.exists(p)]
     hits = scan_docker_files(paths)
+    image_hits = [DockerHit(f"image {_clean(image)}", 0, _clean(image), ins.verdict, install=ins)
+                  for image in (args.image or []) for ins in probe_image(image)]
+    hits.extend(image_hits)
     note = None
     if args.running:
         running, note = scan_running_containers()
         hits.extend(running)
 
-    affected = [h for h in hits if h.verdict.affected]
+    def stale(h: DockerHit) -> bool:
+        return bool(h.install and h.install.stale)
+
+    report_err = write_reports(args, "PHP2Shell Docker scan", rows_from_hits(hits))
+    if report_err:
+        print(report_err, file=sys.stderr)
+
+    affected = [h for h in hits if h.verdict.affected or stale(h)]
     unknown = [h for h in hits if h.verdict.status == STATUS_UNKNOWN]
 
     if args.json:
-        print(json.dumps({"cves": CVES, "note": note, "hits": [
-            {"source": h.source, "line": h.line_no, "image": h.image_tag,
-             "version": h.verdict.version_str, "status": h.verdict.status,
-             "affected": h.verdict.affected, "detail": h.verdict.detail}
-            for h in hits]}, indent=2))
+        rows = []
+        for h in hits:
+            row = {"source": h.source, "line": h.line_no, "image": h.image_tag,
+                   "binary": h.install.binary if h.install else None,
+                   "version": h.verdict.version_str, "status": h.verdict.status,
+                   "affected": h.verdict.affected, "detail": h.verdict.detail}
+            if h.install:
+                row.update({
+                    "config": h.install.config,
+                    "package": asdict(h.install.package) if h.install.package else None,
+                    "stale_processes": [asdict(s) for s in h.install.stale],
+                    "backport_notes": backport_notes(h.install),
+                })
+            rows.append(row)
+        print(json.dumps({"cves": CVES, "note": note, "hits": rows}, indent=2))
     else:
         print(f"PHP2Shell Docker scan  ({', '.join(CVES)})\n")
         if note:
             print(f"  note: {note}\n")
         if not hits:
-            print("  No PHP images found. Pass Dockerfile/compose paths, or --running.")
-            return 0
+            print("  No PHP images found. Pass Dockerfile/compose paths, --image, or --running.")
+            return 2 if report_err else 0
         for h in hits:
             tag = ("AFFECTED" if h.verdict.affected else
-                   "OK" if h.verdict.status == STATUS_PATCHED else "UNKNOWN")
+                   "OK" if h.verdict.status == STATUS_PATCHED else
+                   "OK (distro backport)" if h.verdict.status == STATUS_PATCHED_BACKPORT else
+                   "UNKNOWN")
             loc = h.source + (f":{h.line_no}" if h.line_no else "")
             print(f"  [{tag}] {h.image_tag}  {loc}")
+            if h.install and h.install.raw_version:
+                print(f"      {h.install.binary}: {h.install.raw_version}")
             print(f"      {h.verdict.detail}")
-        if unknown:
+            if h.install:
+                for n in backport_notes(h.install):
+                    print(f"      note: {n}")
+                print_stale(h.install.stale, use_color=False, indent="      ")
+        if any(h.install is None for h in unknown):
             print("\n  UNKNOWN = a branch tag with no patch number (e.g. php:8.3). "
                   "Pin a full patched tag such as php:8.3.36.")
-    sevs = ["high" if h.verdict.affected else "medium"
-            for h in hits if h.verdict.affected or h.verdict.status == STATUS_UNKNOWN]
-    return exit_code_for(sevs, args.fail_on, 1 if affected else 0)
+    if affected:
+        default = 1
+    elif image_hits and all(h.verdict.status == STATUS_UNKNOWN for h in image_hits):
+        default = 2
+    else:
+        default = 0
+    sevs = ["high" if h.verdict.affected or stale(h) else "medium"
+            for h in hits if h.verdict.affected or stale(h) or h.verdict.status == STATUS_UNKNOWN]
+    return 2 if report_err else exit_code_for(sevs, args.fail_on, default)
 
 
 # --- SSH fleet mode ----------------------------------------------------------
@@ -1305,6 +1558,15 @@ def cmd_scan_docker(args: argparse.Namespace) -> int:
 # nothing, opens no ports and sends no exploit traffic.
 
 _REMOTE_PROBE_TEMPLATE = r"""PROC=@PROC@
+# One "CVE <id>" line per ID in changelog text $1. An ID needs a non-digit
+# after it (CVE-2026-1096185 is not ours). Empty text, or a grep with no -o,
+# is NOCHANGELOG rather than "names neither".
+cve_lines() {
+  [ -n "$1" ] || { echo NOCHANGELOG; return; }
+  m=$(printf '%s\n' "$1" | grep -oE '(@CVE_RE@)([^0-9]|$)' 2>/dev/null)
+  [ $? -le 1 ] || { echo NOCHANGELOG; return; }
+  [ -z "$m" ] || printf '%s\n' "$m" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | sed 's/^/CVE /'
+}
 seen=" "
 for name in @NAMES@; do
   p=$(command -v "$name" 2>/dev/null) || continue
@@ -1313,6 +1575,20 @@ for name in @NAMES@; do
   echo "BIN $p"
   "$p" -v 2>&1 | head -n 1 | sed 's/^/VER /'
   "$p" -i 2>/dev/null | grep -E '^(session\.upload_progress\.(enabled|cleanup)|session\.serialize_handler|post_max_size|memory_limit|fatal_error_backtraces) =>' | sed 's/^/INI /'
+  real=$(readlink -f "$p" 2>/dev/null || echo "$p")
+  if command -v dpkg >/dev/null 2>&1 && pkg=$(dpkg -S "$real" 2>/dev/null | head -n 1 | cut -d: -f1 | cut -d, -f1) && [ -n "$pkg" ]; then
+    echo "PKG dpkg $pkg $(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
+    cl=""
+    for d in "$pkg" "$(echo "$pkg" | sed 's/-[a-z]*$/-common/')"; do
+      [ -r "@DOC@/$d/changelog.Debian.gz" ] && { cl="@DOC@/$d/changelog.Debian.gz"; break; }
+    done
+    txt=""
+    [ -z "$cl" ] || txt=$(gzip -dc "$cl" 2>/dev/null)
+    cve_lines "$txt"
+  elif command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf --qf '%{NAME} %{VERSION}-%{RELEASE}' "$real" 2>/dev/null); then
+    echo "PKG rpm $pkg"
+    cve_lines "$(rpm -q --changelog "${pkg%% *}" 2>/dev/null)"
+  fi
 done
 for d in "$PROC"/[0-9]*; do
   pid=${d##*/}
@@ -1337,9 +1613,13 @@ exit 0
 """
 
 
-def build_remote_probe(proc_root: str = "/proc") -> str:
+def build_remote_probe(proc_root: str = "/proc", doc_root: str = "/usr/share/doc") -> str:
+    # Escape ERE metacharacters only: grep 3.8+ warns about a stray `\-`.
+    cve_re = "|".join(re.sub(r"[.^$*+?()\[\]{}|\\]", r"\\\g<0>", c) for c in CVES)
     return (_REMOTE_PROBE_TEMPLATE.replace("@PROC@", proc_root)
-            .replace("@NAMES@", " ".join(PHP_CANDIDATES)))
+            .replace("@NAMES@", " ".join(PHP_CANDIDATES))
+            .replace("@DOC@", doc_root)
+            .replace("@CVE_RE@", cve_re))
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:%-]*$")
@@ -1377,9 +1657,10 @@ def _clean(text: str) -> str:
 
 
 def parse_remote_probe(host: str, text: str) -> list:
-    """Turn the probe's `BIN`/`VER`/`INI`/`STALE` lines into PhpInstall records
-    (one per binary). Restart findings belong to the host: they are attached to
-    its first record, or to a placeholder when no PHP binary was found."""
+    """Turn the probe's `BIN`/`VER`/`INI`/`PKG`/`CVE`/`NOCHANGELOG`/`STALE`
+    lines into PhpInstall records (one per binary). Restart findings belong to
+    the host: they are attached to its first record, or to a placeholder when
+    no PHP binary was found."""
     text = _clean(text.replace("\r", ""))
     installs: list = []
     stale_groups: dict = {}
@@ -1391,6 +1672,7 @@ def parse_remote_probe(host: str, text: str) -> list:
             current.config = parse_ini_posture("\n".join(ini_lines))
             current.upload_progress_enabled = _ini_bool(
                 current.config.get("session.upload_progress.enabled"))
+            apply_backport(current)
 
     for line in text.splitlines():
         tag, _, rest = line.partition(" ")
@@ -1404,6 +1686,18 @@ def parse_remote_probe(host: str, text: str) -> list:
             current.verdict = assess(parse_version(rest))
         elif tag == "INI" and current is not None:
             ini_lines.append(rest)
+        elif tag == "PKG" and current is not None:
+            parts = rest.split()
+            if (len(parts) == 3 and parts[0] in ("dpkg", "rpm")
+                    and _PKG_NAME_RE.fullmatch(parts[1])):
+                current.package = PackageInfo(parts[0], parts[1], _clean(parts[2]), [])
+        elif tag == "CVE" and current is not None and current.package is not None:
+            cve = rest.strip()
+            cves = current.package.cves
+            if cve in CVES and cves is not None and cve not in cves:
+                current.package.cves = sorted(cves + [cve])
+        elif tag == "NOCHANGELOG" and current is not None and current.package is not None:
+            current.package.cves = None
         elif tag == "STALE":
             parts = rest.split(None, 2)
             if len(parts) == 3 and parts[0].isdigit():
@@ -1460,6 +1754,247 @@ def scan_ssh_hosts(path: str, jobs: int = 8) -> list:
     return installs
 
 
+# --- reports -----------------------------------------------------------------
+#
+# --markdown / --html write the same findings to a file as well as the normal
+# output, so a CI job can attach them (Markdown renders in a GitHub job summary).
+
+@dataclass
+class ReportRow:
+    target: str
+    source: str  # "local" | "ssh" | "inventory" | "version" | "dockerfile" | "image" | "container"
+    version: Optional[str]
+    status: str
+    detail: str
+    notes: list = field(default_factory=list)
+
+
+STATUS_RESTART = "restart_needed"
+# Worst first; also the order of the report table.
+_STATUS_ORDER = (STATUS_VULNERABLE, STATUS_VULNERABLE_EOL, STATUS_RESTART,
+                 STATUS_UNKNOWN, STATUS_PATCHED_BACKPORT, STATUS_PATCHED)
+_STATUS_LABEL = {
+    STATUS_VULNERABLE: "vulnerable",
+    STATUS_VULNERABLE_EOL: "vulnerable (EOL)",
+    STATUS_RESTART: "restart needed",
+    STATUS_UNKNOWN: "unknown",
+    STATUS_PATCHED_BACKPORT: "patched (backport)",
+    STATUS_PATCHED: "patched",
+}
+_STATUS_CLASS = {
+    STATUS_VULNERABLE: "bad", STATUS_VULNERABLE_EOL: "bad",
+    STATUS_RESTART: "warn", STATUS_UNKNOWN: "warn",
+    STATUS_PATCHED_BACKPORT: "ok", STATUS_PATCHED: "ok",
+}
+
+
+def _stale_line(sp: StaleProcess) -> str:
+    pids = ", ".join(map(str, sp.pids[:8])) + (", ..." if len(sp.pids) > 8 else "")
+    return f"{sp.name} (pid {pids}): {sp.reason}"
+
+
+def _install_notes(ins: PhpInstall) -> list:
+    notes = backport_notes(ins) + posture_notes(ins) + session_handler_notes(ins)
+    notes += [f"restart needed: {_stale_line(sp)}" for sp in ins.stale]
+    return notes
+
+
+def _row_status(verdict: Verdict, stale: list) -> str:
+    # An affected build stays affected: the fix is the upgrade plus a restart.
+    if stale and not verdict.affected:
+        return STATUS_RESTART
+    return verdict.status
+
+
+def _row_detail(verdict: Verdict, stale: list) -> str:
+    if stale and not verdict.affected:
+        return ("Processes still run PHP code replaced on disk; restart them. "
+                + verdict.detail)
+    return verdict.detail
+
+
+def rows_from_installs(installs: list, source: str, stale: Optional[list] = None) -> list:
+    rows = [ReportRow(_clean(i.binary), source, i.verdict.version_str or _clean(i.raw_version) or None,
+                      _row_status(i.verdict, i.stale), _clean(_row_detail(i.verdict, i.stale)),
+                      [_clean(n) for n in _install_notes(i)])
+            for i in installs]
+    if stale:
+        rows.append(ReportRow(
+            "running PHP processes", "local", None, STATUS_RESTART,
+            "Processes are still running PHP code that was replaced on disk. Restart "
+            "php-fpm / apache2 / your PHP service, then re-check.",
+            [_clean(_stale_line(sp)) for sp in stale]))
+    return rows
+
+
+def rows_from_hits(hits: list) -> list:
+    rows = []
+    for h in hits:
+        ins = h.install
+        if ins:
+            tag = _clean(h.image_tag)
+            target = _clean(ins.binary) + ("" if tag in ins.binary else f" ({tag})")
+            source = "image" if h.source.startswith("image ") else "container"
+            notes = _install_notes(ins)
+            stale = ins.stale
+        else:
+            target = f"{_clean(h.source)}:{h.line_no} ({_clean(h.image_tag)})"
+            source, notes, stale = "dockerfile", [], []
+        rows.append(ReportRow(target, source, h.verdict.version_str,
+                              _row_status(h.verdict, stale), _clean(_row_detail(h.verdict, stale)),
+                              [_clean(n) for n in notes]))
+    return rows
+
+
+def _summary_counts(rows: list) -> list:
+    def n(*statuses: str) -> int:
+        return sum(r.status in statuses for r in rows)
+
+    parts = [(n(STATUS_VULNERABLE, STATUS_VULNERABLE_EOL), "affected"),
+             (n(STATUS_RESTART), "restart needed"),
+             (n(STATUS_UNKNOWN), "unknown"),
+             (n(STATUS_PATCHED, STATUS_PATCHED_BACKPORT), "patched")]
+    return [f"{c} {word}" for c, word in parts if c]
+
+
+def _sorted_rows(rows: list) -> list:
+    rank = {s: i for i, s in enumerate(_STATUS_ORDER)}
+    return sorted(rows, key=lambda r: rank.get(r.status, len(rank)))  # stable
+
+
+def _md(text: str) -> str:
+    """Make untrusted text safe inside a Markdown table cell or list item."""
+    text = html.escape(_clean(str(text)).replace("—", "-"), quote=False)
+    for ch in ("\\", "`", "|", "*", "_", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return " ".join(text.split())
+
+
+def render_markdown(title: str, rows: list, generated_at: str) -> str:
+    out = [f"## {_md(title)}", ""]
+    out.append(" · ".join(_summary_counts(rows)) if rows else "No PHP installs found.")
+    out += ["", f"Generated {_md(generated_at)}. Checked against {', '.join(CVES)}.", ""]
+    rows = _sorted_rows(rows)
+    if rows:
+        out += ["| Status | Target | Version | Detail |", "| --- | --- | --- | --- |"]
+        for r in rows:
+            out.append(f"| {_STATUS_LABEL.get(r.status, _md(r.status))} | {_md(r.target)} "
+                       f"| {_md(r.version or '')} | {_md(r.detail)} |")
+        out.append("")
+    for r in rows:
+        if r.notes:
+            plural = "s" if len(r.notes) != 1 else ""
+            out += ["<details>",
+                    f"<summary>{html.escape(_clean(r.target), quote=False)} "
+                    f"({len(r.notes)} note{plural})</summary>", ""]
+            out += [f"- {_md(n)}" for n in r.notes]
+            out += ["", "</details>", ""]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+_FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+            "%3Cpath d='M16 2l11 4v9c0 7-4.6 12.5-11 15C9.6 27.5 5 22 5 15V6z' fill='%230f766e'/%3E"
+            "%3Cpath d='M10.5 16l4 4 7-8' fill='none' stroke='%23ffffff' stroke-width='2.5' "
+            "stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+
+_HTML_CSS = """
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --fg: #1b1f24; --muted: #5b6573; --border: #d6dbe1;
+  --bad-bg: #fde4e1; --bad-fg: #9b1c12;
+  --warn-bg: #fdf0c8; --warn-fg: #7a4b00;
+  --ok-bg: #d9f2e1; --ok-fg: #14602c;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d; --surface: #1c2229; --fg: #e6e9ed; --muted: #9aa5b2; --border: #323b46;
+    --bad-bg: #4a1d19; --bad-fg: #ffb4ab;
+    --warn-bg: #45350d; --warn-fg: #f5cf73;
+    --ok-bg: #173a24; --ok-fg: #95dca9;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+.summary { font-size: 1.05rem; margin: 8px 0 4px; }
+.meta { color: var(--muted); margin: 0 0 20px; font-size: 0.9rem; }
+.scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 44rem; }
+th, td { text-align: left; vertical-align: top; padding: 10px 12px;
+  border-bottom: 1px solid var(--border); overflow-wrap: break-word; }
+th { white-space: nowrap; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+.ver { white-space: nowrap; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem;
+  font-weight: 600; white-space: nowrap; }
+.bad { background: var(--bad-bg); color: var(--bad-fg); }
+.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.ok { background: var(--ok-bg); color: var(--ok-fg); }
+details { margin-top: 6px; color: var(--muted); }
+summary { cursor: pointer; }
+ul { margin: 6px 0 0; padding-left: 20px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+"""
+
+
+def render_html(title: str, rows: list, generated_at: str) -> str:
+    def esc(value) -> str:
+        return html.escape(_clean(str(value)).replace("—", "-"), quote=True)
+
+    rows = _sorted_rows(rows)
+    body = []
+    if rows:
+        body.append('<div class="scroll"><table>\n<thead><tr><th>Status</th><th>Target</th>'
+                    '<th class="ver">Version</th><th>Detail</th></tr></thead>\n<tbody>')
+        for r in rows:
+            cls = _STATUS_CLASS.get(r.status, "warn")
+            label = _STATUS_LABEL.get(r.status, r.status)
+            notes = ""
+            if r.notes:
+                plural = "s" if len(r.notes) != 1 else ""
+                notes = (f"<details><summary>{len(r.notes)} note{plural}</summary><ul>"
+                         + "".join(f"<li>{esc(n)}</li>" for n in r.notes) + "</ul></details>")
+            body.append(f'<tr><td><span class="pill {cls}">{esc(label)}</span></td>'
+                        f"<td><code>{esc(r.target)}</code></td><td class='ver'>{esc(r.version or '')}</td>"
+                        f"<td>{esc(r.detail)}{notes}</td></tr>")
+        body.append("</tbody></table></div>")
+    summary = " · ".join(_summary_counts(rows)) if rows else "No PHP installs found."
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<title>PHP2Shell report</title>\n'
+        f'<link rel="icon" href="{_FAVICON}">\n<style>{_HTML_CSS}</style>\n</head>\n<body>\n<main>\n'
+        f'<h1>{esc(title)}</h1>\n<p class="summary">{esc(summary)}</p>\n'
+        f'<p class="meta">Generated {esc(generated_at)}. Checked against {esc(", ".join(CVES))}.</p>\n'
+        + "\n".join(body) + "\n</main>\n</body>\n</html>\n")
+
+
+def write_reports(args: argparse.Namespace, title: str, rows: list) -> Optional[str]:
+    """Write --markdown / --html if given. Returns an error message, or None."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for path, render in ((getattr(args, "markdown", None), render_markdown),
+                         (getattr(args, "html", None), render_html)):
+        if not path:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(render(title, rows, now))
+        except OSError as exc:
+            return f"could not write report {path}: {exc.strerror or exc}"
+    return None
+
+
+def add_report_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--markdown", metavar="FILE",
+                        help="also write a Markdown report (renders in a GitHub job summary)")
+    parser.add_argument("--html", metavar="FILE",
+                        help="also write a self-contained HTML report")
+
+
 # --- exit codes / --fail-on --------------------------------------------------
 
 FAIL_ON_CHOICES = ("high", "medium", "low", "none")
@@ -1513,11 +2048,14 @@ def add_fail_on(parser: argparse.ArgumentParser) -> None:
 
 def cmd_check(args: argparse.Namespace) -> int:
     live = False
+    source = "inventory"
     if getattr(args, "inventory", None):
         installs = read_inventory(args.inventory)
     elif getattr(args, "ssh_hosts", None):
+        source = "ssh"
         installs = scan_ssh_hosts(args.ssh_hosts, args.ssh_jobs)
     elif args.version:
+        source = "version"
         v = parse_version(args.version)
         verdict = assess(v)
         install = PhpInstall(binary=f"(version string: {args.version})",
@@ -1527,6 +2065,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         installs = [i for b in find_php_binaries(args.php_binary)
                     if (i := inspect_binary(b)) is not None]
         live = True
+        source = "local"
 
     # Restart awareness only makes sense for the machine we are running on.
     stale: list = []
@@ -1552,6 +2091,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "session_handler_notes": session_handler_notes(i),
                     "stale_processes": [asdict(s) for s in i.stale],
                     "detail": i.verdict.detail,
+                    "package": asdict(i.package) if i.package else None,
+                    "backport_notes": backport_notes(i),
                 }
                 for i in installs
             ],
@@ -1563,7 +2104,12 @@ def cmd_check(args: argparse.Namespace) -> int:
         print_human(installs, use_color=sys.stdout.isatty() and not args.no_color,
                     stale=stale, stale_note=stale_note)
 
-    return check_exit_code(installs, args.fail_on, local_stale=bool(stale))
+    code = check_exit_code(installs, args.fail_on, local_stale=bool(stale))
+    err = write_reports(args, "PHP2Shell check", rows_from_installs(installs, source, stale))
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    return code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1593,6 +2139,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--sarif", action="store_true",
                    help="SARIF output for GitHub code scanning")
     c.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    add_report_args(c)
     c.add_argument("--no-restart-check", action="store_true",
                    help="skip the check for running PHP processes that still "
                         "execute code replaced on disk (Linux /proc)")
@@ -1627,9 +2174,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="scan Dockerfiles/compose files and running containers")
     d.add_argument("paths", nargs="*",
                    help="Dockerfile/compose paths (default: common files in cwd)")
+    d.add_argument("--image", action="append", metavar="IMAGE",
+                   help="probe an image in a throwaway container with no network "
+                        "(docker pulls it if missing). Repeatable")
     d.add_argument("--running", action="store_true",
-                   help="also read PHP versions from running containers via docker")
+                   help="also probe running containers via `docker exec` (read-only)")
     d.add_argument("--json", action="store_true", help="machine-readable output")
+    add_report_args(d)
     add_fail_on(d)
     d.set_defaults(func=cmd_scan_docker)
 

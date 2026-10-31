@@ -1,0 +1,62 @@
+name: PHP2Shell check
+description: Check PHP installs, Dockerfiles and images for the PHP2Shell CVEs and write the findings to the job summary.
+branding:
+  icon: shield
+  color: red
+inputs:
+  command:
+    description: "Command to run: check, scan-docker, scan-logs or scan-code"
+    required: false
+    default: scan-docker
+  args:
+    description: "Arguments after the command, e.g. 'Dockerfile.ci' or '--version 8.3.10'"
+    required: false
+    default: ""
+  fail-on:
+    description: "Exit 1 only at or above high, medium or low, or 'none' to always exit 0. Empty keeps the command's usual exit codes"
+    required: false
+    default: ""
+  python-version:
+    description: "Python version that runs php2shell_check.py"
+    required: false
+    default: "3.13"
+outputs:
+  exit-code:
+    description: "Exit code of php2shell-check: 0 clean, 1 findings at the threshold, 2 usage or error"
+    value: ${{ steps.scan.outputs.exit-code }}
+runs:
+  using: composite
+  steps:
+    # update-environment: false keeps this Python off the caller's PATH for the
+    # rest of their job; the scan step runs it by path instead.
+    - id: python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        update-environment: false
+    - id: scan
+      shell: bash
+      env:
+        P2S_COMMAND: ${{ inputs.command }}
+        P2S_ARGS: ${{ inputs.args }}
+        P2S_FAIL_ON: ${{ inputs.fail-on }}
+        P2S_PYTHON: ${{ steps.python.outputs.python-path }}
+      run: |
+        set +e
+        case "$P2S_COMMAND" in
+          check|scan-docker|scan-logs|scan-code) ;;
+          *) echo "::error::command must be one of check, scan-docker, scan-logs, scan-code"; exit 2 ;;
+        esac
+        # Only these two commands take --markdown.
+        md=""
+        case "$P2S_COMMAND" in
+          check|scan-docker) md="$RUNNER_TEMP/php2shell.md" ;;
+        esac
+        "$P2S_PYTHON" "$GITHUB_ACTION_PATH/php2shell_check.py" "$P2S_COMMAND" $P2S_ARGS \
+          ${P2S_FAIL_ON:+--fail-on "$P2S_FAIL_ON"} ${md:+--markdown "$md"}
+        code=$?
+        if [ -n "$md" ] && [ -s "$md" ]; then
+          cat "$md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit $code
